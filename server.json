@@ -1,0 +1,51 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.cphoskins/notion-full-mcp",
+  "description": "Full-featured Notion MCP server with deep page reading, surgical editing, snapshot/restore, and all block types",
+  "version": "0.1.0",
+  "repository": {
+    "url": "https://github.com/cphoskins/notion-full-mcp",
+    "source": "github"
+  },
+  "packages": [
+    {
+      "registry_name": "pypi",
+      "name": "notion-full-mcp",
+      "version": "0.1.0",
+      "runtime": "python",
+      "environment_variables": [
+        {
+          "name": "NOTION_API_TOKEN",
+          "description": "Your Notion integration API token (starts with ntn_)",
+          "required": true
+        }
+      ]
+    }
+  ],
+  "tools": [
+    {"name": "search_pages", "description": "Search Notion pages by title"},
+    {"name": "search", "description": "Search Notion pages and/or databases"},
+    {"name": "get_page_info", "description": "Get page metadata (title, parent, dates, URL)"},
+    {"name": "create_page", "description": "Create a new page under a parent page or database"},
+    {"name": "update_page", "description": "Update a page's title, icon, or archive status"},
+    {"name": "move_page", "description": "Move a page to a new parent"},
+    {"name": "read_page_deep", "description": "Read page with all nested children recursively"},
+    {"name": "list_block_children", "description": "List direct children of a block or page"},
+    {"name": "get_block", "description": "Get a single block by ID"},
+    {"name": "update_block_text", "description": "Replace all text in a block"},
+    {"name": "find_replace_in_block", "description": "Find/replace text preserving formatting"},
+    {"name": "update_block_rich_text", "description": "Update block with full rich text specification"},
+    {"name": "insert_text_after", "description": "Insert a text block after a specific block"},
+    {"name": "insert_blocks_after", "description": "Insert multiple blocks after a specific block"},
+    {"name": "append_blocks_to_page", "description": "Append blocks to the end of a page"},
+    {"name": "delete_block", "description": "Delete a block by ID"},
+    {"name": "create_comment", "description": "Add a comment to a page"},
+    {"name": "list_comments", "description": "List all comments on a page or block"},
+    {"name": "get_database", "description": "Get database metadata and schema"},
+    {"name": "query_database", "description": "Query a database with filters and sorts"},
+    {"name": "get_self", "description": "Get the current authenticated user/bot"},
+    {"name": "list_users", "description": "List all workspace users"},
+    {"name": "snapshot_page", "description": "Save complete page structure as JSON snapshot"},
+    {"name": "restore_page_from_snapshot", "description": "Restore page from a snapshot (destructive)"}
+  ]
+}
