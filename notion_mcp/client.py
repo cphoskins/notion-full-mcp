@@ -79,6 +79,7 @@ class NotionClient:
         children: list[dict] | None = None,
         icon: str | None = None,
         cover_url: str | None = None,
+        extra_properties: dict | None = None,
     ) -> dict:
         """Create a new page under a parent page or database.
 
@@ -89,14 +90,19 @@ class NotionClient:
             children: Optional list of block objects to include as initial content.
             icon: Optional emoji character for the page icon.
             cover_url: Optional external URL for the page cover image.
+            extra_properties: Optional dict of additional Notion properties to set
+                (e.g., Status, Date, Select fields). Merged with the title property.
         """
+        properties: dict[str, Any] = {
+            "title": {
+                "title": [{"type": "text", "text": {"content": title}}]
+            }
+        }
+        if extra_properties:
+            properties.update(extra_properties)
         body: dict[str, Any] = {
             "parent": {parent_type: parent_id},
-            "properties": {
-                "title": {
-                    "title": [{"type": "text", "text": {"content": title}}]
-                }
-            },
+            "properties": properties,
         }
         if icon:
             body["icon"] = {"type": "emoji", "emoji": icon}
@@ -302,13 +308,11 @@ class NotionClient:
         return created
 
     def insert_blocks_after(self, block_id: str, children: list[dict]) -> list[dict]:
-        """Insert blocks after a specific block."""
-        data = self._patch(
-            f"/blocks/{block_id}/children",
-            {"children": children, "after": block_id},
-        )
-        # The Notion API doesn't support `after` on patch children.
-        # Workaround: we use the parent of the target block and the `after` param.
+        """Insert blocks after a specific block as siblings.
+
+        Finds the parent of the target block and uses the Notion API's
+        ``after`` parameter to insert new blocks immediately after it.
+        """
         block = self.get_block(block_id)
         parent_id = block.get("parent", {}).get("block_id") or block.get("parent", {}).get("page_id")
         if not parent_id:
@@ -600,15 +604,10 @@ class NotionClient:
         else:
             raise ValueError(f"Cannot update rich_text for block type: {btype}")
 
-    def find_and_replace_text(
-        self, block_id: str, old_text: str, new_text: str
-    ) -> dict:
-        """Find and replace text within a block's rich_text, preserving formatting."""
-        block = self.get_block(block_id)
-        btype = block.get("type", "")
-        bdata = block.get(btype, {})
-        rich_texts = bdata.get("rich_text", [])
-
+    def _replace_in_rich_texts(
+        self, rich_texts: list[dict], old_text: str, new_text: str
+    ) -> list[dict]:
+        """Replace old_text with new_text in a list of rich_text segments, preserving formatting."""
         updated = []
         for rt in rich_texts:
             new_rt = {
@@ -622,7 +621,30 @@ class NotionClient:
             if rt.get("text", {}).get("link"):
                 new_rt["text"]["link"] = rt["text"]["link"]
             updated.append(new_rt)
+        return updated
 
+    def find_and_replace_text(
+        self, block_id: str, old_text: str, new_text: str
+    ) -> dict:
+        """Find and replace text within a block's rich_text, preserving formatting.
+
+        Supports all rich_text block types plus table_row cells.
+        """
+        block = self.get_block(block_id)
+        btype = block.get("type", "")
+        bdata = block.get(btype, {})
+
+        if btype == "table_row":
+            cells = bdata.get("cells", [])
+            updated_cells = []
+            for cell in cells:
+                updated_cells.append(self._replace_in_rich_texts(cell, old_text, new_text))
+            return self.update_block(block_id, {
+                "table_row": {"cells": updated_cells}
+            })
+
+        rich_texts = bdata.get("rich_text", [])
+        updated = self._replace_in_rich_texts(rich_texts, old_text, new_text)
         return self.update_block_rich_text(block_id, updated)
 
     # ── Snapshot / Restore ───────────────────────────────────────────

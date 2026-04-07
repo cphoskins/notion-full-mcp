@@ -376,6 +376,7 @@ def create_page(
     parent_type: str = "page_id",
     icon_emoji: str = "",
     children_json: str = "",
+    properties_json: str = "",
 ) -> str:
     """Create a new Notion page under a parent page or database.
 
@@ -385,17 +386,22 @@ def create_page(
         parent_type: "page_id" (default) or "database_id".
         icon_emoji: Optional emoji character to use as the page icon.
         children_json: Optional JSON array of block objects for initial content.
+        properties_json: Optional JSON object of additional database properties to set.
+            Example for setting Status: {"Status": {"status": {"name": "Done"}}}
+            Example for setting Date: {"Due date": {"date": {"start": "2026-04-15"}}}
     """
     try:
         client = _get_client()
         children = json.loads(children_json) if children_json else None
         icon = icon_emoji if icon_emoji else None
+        extra_properties = json.loads(properties_json) if properties_json else None
         result = client.create_page(
             parent_id=parent_id,
             title=title,
             parent_type=parent_type,
             children=children,
             icon=icon,
+            extra_properties=extra_properties,
         )
         title_parts = result.get("properties", {}).get("title", {}).get("title", [])
         created_title = "".join(t.get("plain_text", "") for t in title_parts)
@@ -415,6 +421,7 @@ def update_page(
     title: str = "",
     icon_emoji: str = "",
     archived: bool = False,
+    properties_json: str = "",
 ) -> str:
     """Update a page's title, icon, or archive status.
 
@@ -428,6 +435,10 @@ def update_page(
         title: New title text. Omit or pass "" to leave unchanged.
         icon_emoji: New icon emoji. Omit or pass "" to leave unchanged.
         archived: Pass True to archive the page. Defaults to False (no change sent).
+        properties_json: Optional JSON object of database properties to set.
+            Example: {"Status": {"status": {"name": "Done"}}}
+            Example: {"Due date": {"date": {"start": "2026-04-15"}}}
+            Can be combined with title — both will be applied.
     """
     try:
         client = _get_client()
@@ -438,6 +449,12 @@ def update_page(
                     "title": [{"type": "text", "text": {"content": title}}]
                 }
             }
+        if properties_json:
+            extra = json.loads(properties_json)
+            if properties:
+                properties.update(extra)
+            else:
+                properties = extra
         icon = icon_emoji if icon_emoji else None
         # Only send archived=True when explicitly requested; False is the default
         # no-op so we omit it to avoid accidentally unarchiving pages.
