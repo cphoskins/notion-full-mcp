@@ -2,6 +2,7 @@
 
 import json
 import os
+from pathlib import Path
 
 from fastmcp import FastMCP
 
@@ -287,6 +288,298 @@ def append_blocks_to_page(page_id: str, blocks_json: str) -> str:
             "created_count": len(created),
             "block_ids": [b["id"] for b in created],
         })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+# ── Media & Files ────────────────────────────────────────────────────
+
+
+@mcp.tool
+def upload_file(file_path: str) -> str:
+    """Upload a file to Notion's own storage.
+
+    Returns a ``file_upload_id`` that can be referenced in image, file, pdf,
+    or video blocks via ``{"type": "file_upload", "file_upload": {"id": ...}}``.
+    For the common case of uploading an image and creating a block in one step,
+    use ``upload_image_as_block`` instead.
+
+    Args:
+        file_path: Local path to the file (PNG, JPEG, GIF, SVG, PDF, etc.)
+                   Files up to 20 MiB use single-part mode.
+    """
+    try:
+        client = _get_client()
+        result = client.upload_file(file_path)
+        return json.dumps({
+            "status": "ok",
+            "file_upload_id": result["id"],
+            "filename": result.get("filename", ""),
+            "content_type": result.get("content_type", ""),
+            "upload_status": result.get("status", ""),
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def upload_image_as_block(
+    file_path: str,
+    after_block_id: str = "",
+    parent_id: str = "",
+    caption: str = "",
+) -> str:
+    """Upload an image file to Notion and insert it as a new image block.
+
+    This is the standard replacement for imgur-hosted images. The image is
+    stored in Notion's own workspace storage.
+
+    Args:
+        file_path: Local path to the image (PNG, JPEG, GIF, SVG, WEBP, etc.)
+        after_block_id: If provided, insert immediately after this block (siblings).
+        parent_id: If after_block_id is empty, append to this page/block instead.
+        caption: Optional caption text for the image.
+
+    Exactly one of after_block_id or parent_id must be provided.
+    """
+    try:
+        if not after_block_id and not parent_id:
+            return json.dumps({
+                "status": "error",
+                "message": "Must provide either after_block_id or parent_id",
+            })
+        client = _get_client()
+        upload = client.upload_file(file_path)
+        block = client.make_image_block(
+            file_upload_id=upload["id"],
+            caption=caption,
+        )
+        if after_block_id:
+            created = client.insert_blocks_after(after_block_id, [block])
+        else:
+            created = client.append_children(parent_id, [block])
+        return json.dumps({
+            "status": "ok",
+            "block_id": created[0]["id"] if created else None,
+            "file_upload_id": upload["id"],
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def replace_image_block(
+    block_id: str,
+    file_path: str,
+    caption: str = "",
+) -> str:
+    """Replace an existing image block's content with a newly uploaded image.
+
+    Preserves the block's position in the parent by deleting the old block
+    and inserting the new one after the previous sibling. If the image block
+    is the very first child of its parent, the new block is appended to the
+    end (Notion does not support prepend-at-position).
+
+    Args:
+        block_id: The existing image block to replace.
+        file_path: Local path to the new image.
+        caption: Optional caption for the new image (omit to drop the old one).
+    """
+    try:
+        client = _get_client()
+        old = client.get_block(block_id)
+        if old.get("type") != "image":
+            return json.dumps({
+                "status": "error",
+                "message": f"Block {block_id} is not an image block (got {old.get('type')})",
+            })
+
+        parent_info = old.get("parent", {})
+        parent_id = (
+            parent_info.get("block_id")
+            or parent_info.get("page_id")
+        )
+        if not parent_id:
+            return json.dumps({
+                "status": "error",
+                "message": "Cannot determine parent of image block",
+            })
+
+        siblings = client.get_block_children(parent_id)
+        idx = next(
+            (i for i, b in enumerate(siblings) if b["id"] == block_id),
+            None,
+        )
+        if idx is None:
+            return json.dumps({
+                "status": "error",
+                "message": "Image block not found in parent's children",
+            })
+
+        upload = client.upload_file(file_path)
+        new_block = client.make_image_block(
+            file_upload_id=upload["id"],
+            caption=caption,
+        )
+
+        client.delete_block(block_id)
+
+        if idx == 0:
+            # Notion has no prepend-at-position. Append to end with a warning.
+            created = client.append_children(parent_id, [new_block])
+            warning = "inserted at end of parent (idx=0, prepend not supported)"
+        else:
+            anchor = siblings[idx - 1]["id"]
+            created = client.insert_blocks_after(anchor, [new_block])
+            warning = ""
+
+        resp = {
+            "status": "ok",
+            "old_block_id": block_id,
+            "new_block_id": created[0]["id"] if created else None,
+            "file_upload_id": upload["id"],
+        }
+        if warning:
+            resp["warning"] = warning
+        return json.dumps(resp)
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def download_image_block(block_id: str, output_path: str) -> str:
+    """Download the image file from an image block to a local path.
+
+    Works for all three image source types: external URL, Notion-hosted file,
+    and file_upload references. Notion-hosted URLs are signed and short-lived,
+    so this tool re-fetches them at call time.
+
+    Args:
+        block_id: The image block to download from.
+        output_path: Local path to write the image to.
+    """
+    try:
+        client = _get_client()
+        url = client.get_image_url_from_block(block_id)
+        if not url:
+            return json.dumps({
+                "status": "error",
+                "message": "No downloadable URL found in image block",
+            })
+        result = client.download_file_from_url(url, output_path)
+        return json.dumps({"status": "ok", **result})
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def upload_file_as_block(
+    file_path: str,
+    after_block_id: str = "",
+    parent_id: str = "",
+    caption: str = "",
+    name: str = "",
+) -> str:
+    """Upload a file (PDF, doc, any attachment) to Notion and insert as a file block.
+
+    Analogous to upload_image_as_block but for non-image files. Use this for
+    PDFs, spreadsheets, archives, etc.
+
+    Args:
+        file_path: Local path to the file.
+        after_block_id: If provided, insert after this block (siblings).
+        parent_id: If after_block_id is empty, append to this page/block.
+        caption: Optional caption.
+        name: Optional display name override (defaults to the filename).
+    """
+    try:
+        if not after_block_id and not parent_id:
+            return json.dumps({
+                "status": "error",
+                "message": "Must provide either after_block_id or parent_id",
+            })
+        client = _get_client()
+        upload = client.upload_file(file_path)
+        display_name = name or Path(file_path).name
+        block = client.make_file_block(
+            file_upload_id=upload["id"],
+            caption=caption,
+            name=display_name,
+        )
+        if after_block_id:
+            created = client.insert_blocks_after(after_block_id, [block])
+        else:
+            created = client.append_children(parent_id, [block])
+        return json.dumps({
+            "status": "ok",
+            "block_id": created[0]["id"] if created else None,
+            "file_upload_id": upload["id"],
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+# ── Tables ───────────────────────────────────────────────────────────
+
+
+@mcp.tool
+def insert_table_row(
+    table_id: str,
+    cells_json: str,
+    after_row_id: str = "",
+) -> str:
+    """Insert a new row into an existing table.
+
+    The number of cells must match the table's existing width.
+
+    Args:
+        table_id: The table block ID.
+        cells_json: JSON array. Each element is either:
+            - a plain string (single text segment)
+            - a list of strings (multi-segment plain text in one cell)
+            Example for a 4-column table:
+            '["SMB", "$15K", "$0.015", "$80k - $300k"]'
+        after_row_id: Optional row ID to insert after. If empty, append to end.
+    """
+    try:
+        client = _get_client()
+        cells = json.loads(cells_json)
+        if not isinstance(cells, list):
+            return json.dumps({
+                "status": "error",
+                "message": "cells_json must be a JSON array",
+            })
+        result = client.insert_table_row_after(
+            table_id,
+            cells,
+            after_row_id=after_row_id or None,
+        )
+        return json.dumps({
+            "status": "ok",
+            "block_id": result.get("id", ""),
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def update_table_cell(
+    row_id: str,
+    cell_index: int,
+    new_text: str,
+) -> str:
+    """Replace the text of a single cell in a table row.
+
+    Args:
+        row_id: The table_row block ID.
+        cell_index: Zero-based index of the cell within the row.
+        new_text: New plain-text content for the cell. Overwrites all
+                  existing rich text segments in that cell.
+    """
+    try:
+        client = _get_client()
+        result = client.update_table_cell(row_id, cell_index, new_text)
+        return json.dumps({"status": "ok", "block_id": result.get("id", "")})
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 

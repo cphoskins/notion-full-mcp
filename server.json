@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cphoskins/notion-full-mcp",
-  "description": "Full-featured Notion MCP server with deep page reading, surgical editing, snapshot/restore, and all block types",
+  "description": "Full-featured Notion MCP server with deep page reading, surgical editing, snapshot/restore, file uploads (Notion-hosted images/PDFs), table row manipulation, and all block types",
   "version": "0.1.0",
   "repository": {
     "url": "https://github.com/cphoskins/notion-full-mcp",
@@ -46,6 +46,13 @@
     {"name": "get_self", "description": "Get the current authenticated user/bot"},
     {"name": "list_users", "description": "List all workspace users"},
     {"name": "snapshot_page", "description": "Save complete page structure as JSON snapshot"},
-    {"name": "restore_page_from_snapshot", "description": "Restore page from a snapshot (destructive)"}
+    {"name": "restore_page_from_snapshot", "description": "Restore page from a snapshot (destructive)"},
+    {"name": "upload_file", "description": "Upload a file to Notion's own storage and return a file_upload_id"},
+    {"name": "upload_image_as_block", "description": "Upload an image to Notion and insert it as an image block in one step"},
+    {"name": "replace_image_block", "description": "Replace an existing image block's content with a newly uploaded file"},
+    {"name": "download_image_block", "description": "Download an image block's file to a local path"},
+    {"name": "upload_file_as_block", "description": "Upload any file (PDF, attachment) to Notion and insert it as a file block"},
+    {"name": "insert_table_row", "description": "Insert a new row into an existing table with width validation"},
+    {"name": "update_table_cell", "description": "Replace the text of a single cell in a table row"}
   ]
 }

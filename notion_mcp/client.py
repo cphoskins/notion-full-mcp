@@ -1,6 +1,7 @@
 """Notion API client with full block type support, deep reads, and snapshot/restore."""
 
 import json
+import mimetypes
 import os
 import time
 from pathlib import Path
@@ -328,6 +329,266 @@ class NotionClient:
             data = self._patch(f"/blocks/{parent_id}/children", body)
             all_created.extend(data.get("results", []))
         return all_created
+
+    # ── File Uploads ─────────────────────────────────────────────────
+
+    def create_file_upload(
+        self,
+        filename: str | None = None,
+        content_type: str | None = None,
+        mode: str = "single_part",
+    ) -> dict:
+        """Create a file_upload object to receive an upload.
+
+        Returns the file_upload with an ``id`` that is then used with
+        ``send_file_upload`` to transmit the binary payload.
+        """
+        body: dict[str, Any] = {"mode": mode}
+        if filename:
+            body["filename"] = filename
+        if content_type:
+            body["content_type"] = content_type
+        return self._post("/file_uploads", body)
+
+    def send_file_upload(self, upload_id: str, file_path: str) -> dict:
+        """Upload binary data to a previously-created file_upload.
+
+        Uses multipart/form-data (not JSON), so bypasses the default
+        ``Content-Type: application/json`` header on ``self._http``.
+        """
+        path = Path(file_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+
+        content_type, _ = mimetypes.guess_type(str(path))
+        if not content_type:
+            content_type = "application/octet-stream"
+
+        with path.open("rb") as f:
+            files = {"file": (path.name, f, content_type)}
+            # Fresh httpx call without the JSON Content-Type from self._http.
+            r = httpx.post(
+                f"{NOTION_API_BASE}/file_uploads/{upload_id}/send",
+                headers={
+                    "Authorization": f"Bearer {self.token}",
+                    "Notion-Version": NOTION_VERSION,
+                },
+                files=files,
+                timeout=120.0,
+            )
+        r.raise_for_status()
+        time.sleep(RATE_LIMIT_DELAY)
+        return r.json()
+
+    def upload_file(self, file_path: str) -> dict:
+        """Complete file upload: create + send. Returns the final file_upload object.
+
+        Use the returned ``id`` in image/file/pdf blocks via ``make_image_block``
+        or by constructing a block with ``{"type": "file_upload", "file_upload": {"id": ...}}``.
+        """
+        path = Path(file_path).expanduser()
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        content_type, _ = mimetypes.guess_type(str(path))
+        upload = self.create_file_upload(
+            filename=path.name,
+            content_type=content_type,
+        )
+        self.send_file_upload(upload["id"], str(path))
+        # Re-fetch to get the uploaded state (status, etc.)
+        return self._get(f"/file_uploads/{upload['id']}")
+
+    def get_file_upload(self, upload_id: str) -> dict:
+        """Get the current state of a file_upload (status, URLs, etc.)."""
+        return self._get(f"/file_uploads/{upload_id}")
+
+    # ── Block Builders for Media ─────────────────────────────────────
+
+    @staticmethod
+    def make_image_block(
+        file_upload_id: str | None = None,
+        external_url: str | None = None,
+        caption: str = "",
+    ) -> dict:
+        """Build an image block using either a Notion file_upload or an external URL.
+
+        Exactly one of ``file_upload_id`` or ``external_url`` must be provided.
+        """
+        if file_upload_id and external_url:
+            raise ValueError("Provide only one of file_upload_id or external_url")
+        if not file_upload_id and not external_url:
+            raise ValueError("Must provide file_upload_id or external_url")
+
+        if file_upload_id:
+            image: dict[str, Any] = {
+                "type": "file_upload",
+                "file_upload": {"id": file_upload_id},
+            }
+        else:
+            image = {
+                "type": "external",
+                "external": {"url": external_url},
+            }
+
+        if caption:
+            image["caption"] = [
+                {"type": "text", "text": {"content": caption}}
+            ]
+
+        return {"object": "block", "type": "image", "image": image}
+
+    @staticmethod
+    def make_file_block(
+        file_upload_id: str | None = None,
+        external_url: str | None = None,
+        caption: str = "",
+        name: str = "",
+    ) -> dict:
+        """Build a file block (PDF, generic file attachment)."""
+        if file_upload_id and external_url:
+            raise ValueError("Provide only one of file_upload_id or external_url")
+        if not file_upload_id and not external_url:
+            raise ValueError("Must provide file_upload_id or external_url")
+
+        if file_upload_id:
+            f: dict[str, Any] = {
+                "type": "file_upload",
+                "file_upload": {"id": file_upload_id},
+            }
+        else:
+            f = {"type": "external", "external": {"url": external_url}}
+
+        if caption:
+            f["caption"] = [{"type": "text", "text": {"content": caption}}]
+        if name:
+            f["name"] = name
+
+        return {"object": "block", "type": "file", "file": f}
+
+    def download_file_from_url(self, url: str, output_path: str) -> dict:
+        """Download a file from any URL (external or Notion-hosted signed) to disk."""
+        out = Path(output_path).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        r = httpx.get(url, timeout=120.0, follow_redirects=True)
+        r.raise_for_status()
+        out.write_bytes(r.content)
+        return {"path": str(out), "size": len(r.content)}
+
+    def get_image_url_from_block(self, block_id: str) -> str:
+        """Extract the download URL from an image block (external, file, or file_upload)."""
+        block = self.get_block(block_id)
+        if block.get("type") != "image":
+            raise ValueError(f"Block {block_id} is not an image block")
+        image = block.get("image", {})
+        itype = image.get("type", "")
+        if itype == "external":
+            return image.get("external", {}).get("url", "")
+        if itype == "file":
+            # Notion-hosted signed URL
+            return image.get("file", {}).get("url", "")
+        if itype == "file_upload":
+            # Fetch the file_upload object to get a download URL
+            upload_id = image.get("file_upload", {}).get("id", "")
+            if not upload_id:
+                return ""
+            info = self.get_file_upload(upload_id)
+            # file_upload objects expose the URL under `file.url` once completed
+            return info.get("file", {}).get("url", "") or info.get("url", "")
+        return ""
+
+    # ── Table Row Operations ─────────────────────────────────────────
+
+    def insert_table_row_after(
+        self,
+        table_id: str,
+        cells: list,
+        after_row_id: str | None = None,
+    ) -> dict:
+        """Insert a new row into an existing table.
+
+        Args:
+            table_id: The table block ID.
+            cells: List of cell contents. Each cell can be:
+                - a plain string ("hello")  → single text segment
+                - a list of strings (["bold", " normal"]) → multi-segment
+                - a list of dicts → pre-built rich_text segments (advanced)
+            after_row_id: If provided, insert after this specific row. Otherwise
+                append to the end of the table.
+
+        Returns the created row block.
+        """
+        table = self.get_block(table_id)
+        if table.get("type") != "table":
+            raise ValueError(f"Block {table_id} is not a table")
+
+        table_width = table.get("table", {}).get("table_width")
+        if table_width and len(cells) != table_width:
+            raise ValueError(
+                f"Table width is {table_width} but got {len(cells)} cells"
+            )
+
+        # Build rich_text cells
+        row_cells: list[list[dict]] = []
+        for cell in cells:
+            if isinstance(cell, str):
+                row_cells.append(
+                    [{"type": "text", "text": {"content": cell}}]
+                )
+            elif isinstance(cell, list):
+                segments: list[dict] = []
+                for seg in cell:
+                    if isinstance(seg, dict):
+                        segments.append(seg)
+                    else:
+                        segments.append(
+                            {"type": "text", "text": {"content": str(seg)}}
+                        )
+                row_cells.append(segments)
+            else:
+                row_cells.append(
+                    [{"type": "text", "text": {"content": str(cell)}}]
+                )
+
+        row_block = {
+            "object": "block",
+            "type": "table_row",
+            "table_row": {"cells": row_cells},
+        }
+
+        # Determine where to insert
+        if after_row_id is None:
+            existing_rows = self.get_block_children(table_id)
+            if not existing_rows:
+                # Empty table — append directly
+                created = self.append_children(table_id, [row_block])
+                return created[0] if created else {}
+            after_row_id = existing_rows[-1]["id"]
+
+        created = self.insert_blocks_after(after_row_id, [row_block])
+        return created[0] if created else {}
+
+    def update_table_cell(
+        self,
+        row_id: str,
+        cell_index: int,
+        new_text: str,
+    ) -> dict:
+        """Replace the text of a single cell in a table row (plain-text shortcut)."""
+        row = self.get_block(row_id)
+        if row.get("type") != "table_row":
+            raise ValueError(f"Block {row_id} is not a table_row")
+        cells = row.get("table_row", {}).get("cells", [])
+        if cell_index < 0 or cell_index >= len(cells):
+            raise ValueError(
+                f"cell_index {cell_index} out of range (row has {len(cells)} cells)"
+            )
+        updated_cells = list(cells)
+        updated_cells[cell_index] = [
+            {"type": "text", "text": {"content": new_text}}
+        ]
+        return self.update_block(
+            row_id, {"table_row": {"cells": updated_cells}}
+        )
 
     # ── Rich Text Helpers ────────────────────────────────────────────
 
