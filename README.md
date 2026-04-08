@@ -1,7 +1,13 @@
 <!-- mcp-name: io.github.cphoskins/notion-full-mcp -->
 # notion-full-mcp
 
-Full-featured Notion MCP server with deep page reading, surgical block editing, snapshot/restore, and all block types including tables.
+Full-featured Notion MCP server with deep page reading, surgical block editing, snapshot/restore, file uploads (Notion-hosted images and PDFs), table row manipulation, and all block types including tables.
+
+## What's new in v0.2.0
+
+- **Notion file uploads.** Upload images and files directly to Notion's own workspace storage instead of relying on external hosts like imgur. Works for PNG, JPEG, SVG, GIF, PDF, and any other Notion-supported attachment type.
+- **Image block helpers.** `upload_image_as_block` uploads a file and inserts it at a position in one call. `replace_image_block` swaps an existing image's content while preserving its position in the parent. `download_image_block` pulls any image block's file to disk.
+- **Table row manipulation.** `insert_table_row` adds a row to an existing table with automatic width validation. `update_table_cell` replaces the text of a single cell. No more rebuild-the-whole-table for small edits.
 
 ## Install
 
@@ -50,7 +56,7 @@ Or for local development:
 }
 ```
 
-## Tools (24)
+## Tools (31)
 
 ### Search & Pages
 
@@ -120,6 +126,23 @@ Or for local development:
 |------|-------------|
 | `snapshot_page` | Save complete page structure as JSON |
 | `restore_page_from_snapshot` | Restore page from a snapshot (destructive) |
+
+### Media & Files
+
+| Tool | Description |
+|------|-------------|
+| `upload_file` | Upload a file to Notion's own workspace storage (returns `file_upload_id`) |
+| `upload_image_as_block` | Upload an image and insert it as a new image block in one step (after a block or appended to a page) |
+| `replace_image_block` | Swap an existing image block's content with a newly uploaded file, preserving its position |
+| `download_image_block` | Download the image file from an image block to disk — works for external URLs, Notion-hosted files, and `file_upload` references |
+| `upload_file_as_block` | Upload any file (PDF, attachment) and insert it as a file block |
+
+### Tables
+
+| Tool | Description |
+|------|-------------|
+| `insert_table_row` | Insert a new row into an existing table with automatic width validation |
+| `update_table_cell` | Replace the text of a single cell in a table row |
 
 ## Notion API Token
 
