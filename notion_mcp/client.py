@@ -142,11 +142,207 @@ class NotionClient:
         new_parent_id: str,
         parent_type: str = "page_id",
     ) -> dict:
-        """Move a page to a new parent page or database."""
-        return self._patch(
-            f"/pages/{page_id}",
-            {"parent": {parent_type: new_parent_id}},
+        """NOT SUPPORTED by the Notion public API.
+
+        Notion's PATCH /pages/{id} endpoint silently ignores ``parent`` field
+        changes -- the call returns HTTP 200 but the page is not actually moved.
+        This method now raises to prevent callers from relying on broken
+        behavior. Use ``copy_page_to_parent`` for a destructive recreate-and-
+        archive alternative, or move the page manually in the Notion UI.
+        """
+        raise NotImplementedError(
+            "Notion's public API does not support changing a page's parent "
+            "via PATCH /pages/{id}. The endpoint silently ignores the parent "
+            "field. Use copy_page_to_parent(page_id, new_parent_id) for a "
+            "destructive recreate-and-archive alternative, or move the page "
+            "manually by dragging it in the Notion sidebar."
         )
+
+    def restore_page(self, page_id: str) -> dict:
+        """Restore a page from trash by sending archived=False.
+
+        This is the explicit counterpart to ``delete_block(page_id)`` which
+        archives a page (moves it to trash). ``update_page`` has a safety
+        guard that blocks archived=False to prevent accidental restoration,
+        so this dedicated method is the supported way to unarchive.
+
+        Cascades automatically restore direct-child pages and blocks that
+        were archived as part of the same delete cascade.
+        """
+        return self._patch(f"/pages/{page_id}", {"archived": False})
+
+    def copy_page_to_parent(
+        self,
+        page_id: str,
+        new_parent_id: str,
+        parent_type: str = "page_id",
+        archive_original: bool = True,
+    ) -> dict:
+        """Destructively recreate a page under a new parent.
+
+        This is the workaround for Notion's public API not supporting parent
+        changes on existing pages. Creates a new page at ``new_parent_id``
+        with the same title, icon, and content, then optionally archives the
+        original.
+
+        LIMITATIONS:
+            * Block IDs of the new page differ from the original, so any
+              external references (graphics-spec.md, cross-page block links)
+              to the original block IDs go stale.
+            * file_upload image blocks are copied as ``external`` URLs using
+              the current signed URL returned by the Notion API. Those signed
+              URLs are short-lived (~1 hour). For permanent preservation of
+              file_upload images in the copied page, re-upload the source
+              files via upload_image_as_block after the copy completes.
+            * child_page descendants (nested subpages) are NOT recursively
+              copied. If the page contains any child_page blocks, this
+              method raises to prevent silent data loss. Copy nested pages
+              individually.
+            * Comments, page history, permissions, and synced blocks are not
+              copied.
+            * Tables are copied with inline row children; very large tables
+              may hit Notion's 100-children-per-request limit and will be
+              split into multiple append_children batches automatically.
+
+        Returns a dict with the new page id, url, and archive status.
+        """
+        source = self.get_page(page_id)
+        title_parts = (
+            source.get("properties", {}).get("title", {}).get("title", [])
+        )
+        title = "".join(t.get("plain_text", "") for t in title_parts)
+        icon = source.get("icon")
+        icon_emoji = None
+        if icon and icon.get("type") == "emoji":
+            icon_emoji = icon.get("emoji")
+
+        blocks = self.get_block_children_deep(page_id, max_depth=10)
+
+        # Guardrail: refuse if there are nested child_page blocks anywhere.
+        def has_child_page(block_list: list) -> bool:
+            for b in block_list:
+                if b.get("type") == "child_page":
+                    return True
+                if b.get("children") and has_child_page(b["children"]):
+                    return True
+            return False
+
+        if has_child_page(blocks):
+            raise ValueError(
+                f"Cannot copy page {page_id}: the page (or a descendant) "
+                f"contains nested child_page blocks. Notion's API does not "
+                f"support recreating nested pages inline. Copy nested pages "
+                f"manually or use the Notion UI drag-and-drop."
+            )
+
+        write_blocks: list[dict] = []
+        for block in blocks:
+            converted = self._convert_block_for_copy(block)
+            if converted:
+                write_blocks.append(converted)
+
+        new_page = self.create_page(
+            parent_id=new_parent_id,
+            title=title,
+            parent_type=parent_type,
+            children=None,
+            icon=icon_emoji,
+        )
+        new_page_id = new_page["id"]
+
+        if write_blocks:
+            self.append_children(new_page_id, write_blocks)
+
+        if archive_original:
+            self._patch(f"/pages/{page_id}", {"archived": True})
+
+        return {
+            "status": "ok",
+            "new_page_id": new_page_id,
+            "new_page_url": new_page.get("url", ""),
+            "original_page_id": page_id,
+            "original_archived": archive_original,
+            "blocks_copied": len(write_blocks),
+        }
+
+    @classmethod
+    def _convert_block_for_copy(cls, block: dict) -> dict | None:
+        """Extend convert_block_for_write with image/file/bookmark support.
+
+        Used by copy_page_to_parent. For file_upload-hosted media the block
+        is downgraded to an ``external`` reference using the current (signed,
+        short-lived) URL. The caller is expected to re-upload permanent
+        copies via upload_image_as_block after the copy completes.
+        """
+        btype = block.get("type", "")
+        bdata = block.get(btype, {})
+
+        if btype == "image":
+            itype = bdata.get("type", "")
+            url = ""
+            if itype == "external":
+                url = bdata.get("external", {}).get("url", "")
+            elif itype == "file":
+                url = bdata.get("file", {}).get("url", "")
+            elif itype == "file_upload":
+                fu = bdata.get("file_upload", {})
+                # Some responses embed the url under .file.url; fall back to .url
+                url = (
+                    fu.get("file", {}).get("url", "")
+                    if isinstance(fu.get("file"), dict)
+                    else ""
+                )
+            if not url:
+                return None
+            result: dict = {
+                "object": "block",
+                "type": "image",
+                "image": {"type": "external", "external": {"url": url}},
+            }
+            if bdata.get("caption"):
+                result["image"]["caption"] = cls.convert_rich_text_for_write(
+                    bdata["caption"]
+                )
+            return result
+
+        if btype == "file":
+            ftype = bdata.get("type", "")
+            url = ""
+            if ftype == "external":
+                url = bdata.get("external", {}).get("url", "")
+            elif ftype == "file":
+                url = bdata.get("file", {}).get("url", "")
+            if not url:
+                return None
+            result = {
+                "object": "block",
+                "type": "file",
+                "file": {"type": "external", "external": {"url": url}},
+            }
+            if bdata.get("caption"):
+                result["file"]["caption"] = cls.convert_rich_text_for_write(
+                    bdata["caption"]
+                )
+            if bdata.get("name"):
+                result["file"]["name"] = bdata["name"]
+            return result
+
+        if btype == "bookmark":
+            return {
+                "object": "block",
+                "type": "bookmark",
+                "bookmark": {"url": bdata.get("url", "")},
+            }
+
+        if btype == "embed":
+            return {
+                "object": "block",
+                "type": "embed",
+                "embed": {"url": bdata.get("url", "")},
+            }
+
+        # Fall back to the standard converter for everything else.
+        return cls.convert_block_for_write(block)
 
     # ── Comments ─────────────────────────────────────────────────────
 

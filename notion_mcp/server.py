@@ -769,17 +769,103 @@ def move_page(
     new_parent_id: str,
     parent_type: str = "page_id",
 ) -> str:
-    """Move a page to a new parent page or database.
+    """NOT SUPPORTED: Notion's public API does not support moving a page.
+
+    The PATCH /pages/{id} endpoint silently ignores parent field changes --
+    the call returns HTTP 200 but the page is not actually moved. This tool
+    is preserved only to return a clear error message and point callers to
+    the working alternatives.
+
+    To move a page, use one of these instead:
+        * copy_page_to_parent -- destructive recreate-and-archive (block IDs
+          will change, file_upload media degrades to short-lived URLs)
+        * Manually drag the page in the Notion sidebar (recommended for
+          pages with nested subpages or heavy media content)
+    """
+    return json.dumps({
+        "status": "error",
+        "message": (
+            "move_page is not supported. Notion's public API silently ignores "
+            "parent changes on PATCH /pages/{id}. Use copy_page_to_parent "
+            "for a destructive recreate-and-archive alternative, or move the "
+            "page manually in the Notion UI."
+        ),
+    })
+
+
+@mcp.tool
+def restore_page(page_id: str) -> str:
+    """Restore a page (and its children) from trash.
+
+    This is the explicit counterpart to delete_block on a page. ``update_page``
+    has a safety guard that blocks archived=False; this dedicated tool is
+    the supported way to unarchive.
+
+    When called on a page that was archived via a cascade (for example, a
+    section container that was deleted along with its subpages), restoring
+    the parent container automatically restores the cascaded descendants.
 
     Args:
-        page_id: The page to move.
-        new_parent_id: ID of the destination parent.
-        parent_type: "page_id" (default) or "database_id".
+        page_id: The page to restore from trash.
     """
     try:
         client = _get_client()
-        result = client.move_page(page_id, new_parent_id, parent_type=parent_type)
-        return json.dumps({"status": "ok", "id": result["id"]}, indent=2)
+        result = client.restore_page(page_id)
+        return json.dumps({
+            "status": "ok",
+            "id": result["id"],
+            "archived": result.get("archived", False),
+            "in_trash": result.get("in_trash", False),
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
+
+
+@mcp.tool
+def copy_page_to_parent(
+    page_id: str,
+    new_parent_id: str,
+    parent_type: str = "page_id",
+    archive_original: bool = True,
+) -> str:
+    """Recreate a page under a new parent (destructive workaround for move).
+
+    Since Notion's public API does not support changing a page's parent,
+    this tool works around the limitation by creating a new page at the
+    target location with the same title, icon, and content, then archiving
+    the original.
+
+    LIMITATIONS (read carefully):
+        * Block IDs of the new page are different from the original. Any
+          external references to original block IDs (graphics-spec.md,
+          cross-page links, Change Log entries) will point at the archived
+          original and need to be updated.
+        * file_upload image blocks are copied as external URL references
+          using the Notion-signed URL returned at copy time. Those URLs
+          expire within an hour. For permanent preservation, re-upload the
+          source files via upload_image_as_block after the copy.
+        * child_page descendants (nested subpages) are NOT recursively
+          copied -- the tool refuses to run if any are present. Copy them
+          individually.
+        * Comments, page history, permissions, and synced blocks are not
+          copied.
+
+    Args:
+        page_id: The source page to copy.
+        new_parent_id: The target parent page or database ID.
+        parent_type: "page_id" (default) or "database_id".
+        archive_original: If True (default), archive the source page after
+            the copy completes. Set False to keep both copies side-by-side.
+    """
+    try:
+        client = _get_client()
+        result = client.copy_page_to_parent(
+            page_id=page_id,
+            new_parent_id=new_parent_id,
+            parent_type=parent_type,
+            archive_original=archive_original,
+        )
+        return json.dumps(result)
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 

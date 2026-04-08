@@ -1,7 +1,7 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cphoskins/notion-full-mcp",
-  "description": "Full-featured Notion MCP server with deep page reading, surgical editing, snapshot/restore, file uploads (Notion-hosted images/PDFs), table row manipulation, and all block types",
+  "description": "Full-featured Notion MCP server with deep page reading, surgical editing, snapshot/restore, file uploads (Notion-hosted images/PDFs), table row manipulation, page restore from trash, destructive page copy across parents, and all block types",
   "version": "0.2.1",
   "repository": {
     "url": "https://github.com/cphoskins/notion-full-mcp",
@@ -28,7 +28,9 @@
     {"name": "get_page_info", "description": "Get page metadata (title, parent, dates, URL)"},
     {"name": "create_page", "description": "Create a new page under a parent page or database"},
     {"name": "update_page", "description": "Update a page's title, icon, or archive status"},
-    {"name": "move_page", "description": "Move a page to a new parent"},
+    {"name": "move_page", "description": "DEPRECATED: Notion's public API does not support moving pages. Returns a clear error pointing to copy_page_to_parent"},
+    {"name": "restore_page", "description": "Restore a page (and its cascade-archived children) from trash"},
+    {"name": "copy_page_to_parent", "description": "Recreate a page under a new parent (destructive workaround since the public API does not support parent changes; archives the original by default)"},
     {"name": "read_page_deep", "description": "Read page with all nested children recursively"},
     {"name": "list_block_children", "description": "List direct children of a block or page"},
     {"name": "get_block", "description": "Get a single block by ID"},

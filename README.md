@@ -1,7 +1,13 @@
 <!-- mcp-name: io.github.cphoskins/notion-full-mcp -->
 # notion-full-mcp
 
-Full-featured Notion MCP server with deep page reading, surgical block editing, snapshot/restore, file uploads (Notion-hosted images and PDFs), table row manipulation, and all block types including tables.
+Full-featured Notion MCP server with deep page reading, surgical block editing, snapshot/restore, file uploads (Notion-hosted images and PDFs), table row manipulation, page restore from trash, destructive page copy across parents, and all block types including tables.
+
+## What's new in v0.3.0
+
+- **Page restore from trash.** `restore_page` explicitly unarchives a page by sending `archived=False`. This is the counterpart to `delete_block` on a page and works around the intentional safety guard in `update_page` that blocks `archived=False`. Cascaded child archives are restored automatically when the parent is restored.
+- **Destructive page copy across parents.** `copy_page_to_parent` is the workaround for Notion's public API not supporting parent changes. Recreates the page at the target parent with the same title, icon, and content, then archives the original. Handles paragraphs, headings, lists, tables, dividers, code blocks, and image/file blocks. Refuses to run if the source has nested `child_page` descendants (copy those manually).
+- **`move_page` deprecated and now raises.** Notion's `PATCH /pages/{id}` endpoint silently ignores parent field changes -- calls return HTTP 200 but do nothing. The `move_page` tool now returns a clear error pointing callers to `copy_page_to_parent` or manual drag-and-drop in the Notion sidebar.
 
 ## What's new in v0.2.0
 
@@ -56,7 +62,7 @@ Or for local development:
 }
 ```
 
-## Tools (31)
+## Tools (33)
 
 ### Search & Pages
 
@@ -67,7 +73,9 @@ Or for local development:
 | `get_page_info` | Get page metadata (title, parent, dates, URL) |
 | `create_page` | Create a new page under a parent page or database |
 | `update_page` | Update a page's title, icon, or archive status |
-| `move_page` | Move a page to a new parent |
+| `move_page` | **DEPRECATED** -- Notion's public API does not support moving pages. Returns a clear error pointing to `copy_page_to_parent` |
+| `restore_page` | Restore a page (and its cascade-archived children) from trash |
+| `copy_page_to_parent` | Recreate a page under a new parent (destructive workaround for the missing move capability; archives the original by default) |
 
 ### Reading
 
