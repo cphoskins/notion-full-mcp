@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "notion-full-mcp"
-version = "0.2.1"
+version = "0.3.0"
 description = "Full-featured Notion MCP server with deep page reading, surgical editing, snapshot/restore, file uploads (Notion-hosted images/PDFs), table row manipulation, and all block types"
 readme = "README.md"
 license = "MIT"
