@@ -199,11 +199,36 @@ def find_replace_in_block(block_id: str, old_text: str, new_text: str) -> str:
 
     Replaces occurrences of old_text with new_text in each rich text segment
     while keeping bold, italic, links, and other annotations intact.
+
+    Returns an error (not a silent no-op) if old_text does not appear in the
+    block. The error message includes the block's current plain text so the
+    caller can diagnose Unicode / whitespace / formatting mismatches (e.g.,
+    en-dash U+2013 vs hyphen-minus U+002D, curly vs straight quotes,
+    non-breaking space U+00A0 vs regular space). Use update_block_text or
+    update_table_cell for full-text replacement when find/replace doesn't
+    match because of character mismatches.
+
+    The success response includes a ``replacements`` field with the total
+    number of occurrences of old_text that were replaced.
     """
     try:
         client = _get_client()
         result = client.find_and_replace_text(block_id, old_text, new_text)
-        return json.dumps({"status": "ok", "block_id": result["id"]})
+        return json.dumps({
+            "status": "ok",
+            "block_id": result["id"],
+            "replacements": result.get("replacements", 0),
+        })
+    except ValueError as e:
+        # Unicode / whitespace mismatch -- surface the diagnostic to the caller
+        # so the silent no-op that previously masked IR-R3-14 and IR-R4 fixes
+        # becomes an explicit error with a preview of the block's actual text.
+        return json.dumps({
+            "status": "error",
+            "error_type": "text_not_found",
+            "message": str(e),
+            "hint": "Use update_block_text or update_table_cell for full replacement when find/replace doesn't match due to character mismatches.",
+        })
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 

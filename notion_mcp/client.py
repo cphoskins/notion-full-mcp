@@ -1063,14 +1063,22 @@ class NotionClient:
 
     def _replace_in_rich_texts(
         self, rich_texts: list[dict], old_text: str, new_text: str
-    ) -> list[dict]:
-        """Replace old_text with new_text in a list of rich_text segments, preserving formatting."""
+    ) -> tuple[list[dict], int]:
+        """Replace old_text with new_text in a list of rich_text segments, preserving formatting.
+
+        Returns a tuple of (updated_segments, replacement_count) where replacement_count
+        is the total number of occurrences of old_text that were replaced across all segments.
+        """
         updated = []
+        total_replacements = 0
         for rt in rich_texts:
+            original = rt.get("plain_text", "")
+            count = original.count(old_text) if old_text else 0
+            total_replacements += count
             new_rt = {
                 "type": "text",
                 "text": {
-                    "content": rt.get("plain_text", "").replace(old_text, new_text),
+                    "content": original.replace(old_text, new_text),
                 },
             }
             if rt.get("annotations"):
@@ -1078,7 +1086,7 @@ class NotionClient:
             if rt.get("text", {}).get("link"):
                 new_rt["text"]["link"] = rt["text"]["link"]
             updated.append(new_rt)
-        return updated
+        return updated, total_replacements
 
     def find_and_replace_text(
         self, block_id: str, old_text: str, new_text: str
@@ -1086,6 +1094,15 @@ class NotionClient:
         """Find and replace text within a block's rich_text, preserving formatting.
 
         Supports all rich_text block types plus table_row cells.
+
+        Raises ValueError if old_text does not appear in the block's text.
+        The error message includes the block's current plain text (up to 500 chars)
+        so the caller can diagnose Unicode / whitespace / formatting mismatches
+        (e.g., en-dash U+2013 vs hyphen-minus U+002D, curly vs straight quotes,
+        non-breaking vs regular spaces).
+
+        Returns the block-update result dict with an added ``replacements`` key
+        containing the total number of occurrences of old_text that were replaced.
         """
         block = self.get_block(block_id)
         btype = block.get("type", "")
@@ -1094,15 +1111,58 @@ class NotionClient:
         if btype == "table_row":
             cells = bdata.get("cells", [])
             updated_cells = []
+            total_replacements = 0
             for cell in cells:
-                updated_cells.append(self._replace_in_rich_texts(cell, old_text, new_text))
-            return self.update_block(block_id, {
-                "table_row": {"cells": updated_cells}
-            })
+                new_cell, cell_count = self._replace_in_rich_texts(
+                    cell, old_text, new_text
+                )
+                updated_cells.append(new_cell)
+                total_replacements += cell_count
+
+            if total_replacements == 0:
+                # Build a preview of the current plain text across all cells
+                current_text = " | ".join(
+                    "".join(seg.get("plain_text", "") for seg in cell)
+                    for cell in cells
+                )
+                raise ValueError(
+                    f"find_and_replace_text: old_text not found in block {block_id} "
+                    f"(table_row, {len(cells)} cells). "
+                    f"Current text preview (up to 500 chars): {current_text[:500]!r}. "
+                    f"Searched for: {old_text!r}. "
+                    f"This often indicates a Unicode character mismatch (en-dash vs hyphen, "
+                    f"curly vs straight quotes, non-breaking space vs regular space). "
+                    f"Consider using update_block_text or update_table_cell for full replacement, "
+                    f"or copy the exact string from the preview above."
+                )
+
+            result = self.update_block(
+                block_id, {"table_row": {"cells": updated_cells}}
+            )
+            result["replacements"] = total_replacements
+            return result
 
         rich_texts = bdata.get("rich_text", [])
-        updated = self._replace_in_rich_texts(rich_texts, old_text, new_text)
-        return self.update_block_rich_text(block_id, updated)
+        updated, total_replacements = self._replace_in_rich_texts(
+            rich_texts, old_text, new_text
+        )
+
+        if total_replacements == 0:
+            current_text = "".join(seg.get("plain_text", "") for seg in rich_texts)
+            raise ValueError(
+                f"find_and_replace_text: old_text not found in block {block_id} "
+                f"(type={btype!r}). "
+                f"Current text preview (up to 500 chars): {current_text[:500]!r}. "
+                f"Searched for: {old_text!r}. "
+                f"This often indicates a Unicode character mismatch (en-dash vs hyphen, "
+                f"curly vs straight quotes, non-breaking space vs regular space). "
+                f"Consider using update_block_text for full replacement, "
+                f"or copy the exact string from the preview above."
+            )
+
+        result = self.update_block_rich_text(block_id, updated)
+        result["replacements"] = total_replacements
+        return result
 
     # ── Snapshot / Restore ───────────────────────────────────────────
 
