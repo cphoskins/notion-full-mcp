@@ -621,13 +621,20 @@ def delete_block(block_id: str) -> str:
 
 
 @mcp.tool
-def snapshot_page(page_id: str, output_path: str = "") -> str:
+def snapshot_page(
+    page_id: str, output_path: str = "", include_files: bool = False
+) -> str:
     """Create a complete snapshot of a page with all nested children.
 
     Saves to a JSON file if output_path is provided. The snapshot includes
     the full block tree with recursive children, suitable for restore.
     Subpages and inline databases are recorded as blocks but their own
     content is not captured.
+
+    Set include_files to also download Notion-hosted images and files into a
+    ``<snapshot name>.files`` folder beside the JSON. A restore can then
+    upload them again even after they have left Notion's trash. Without it,
+    the snapshot holds only links that expire within the hour.
 
     Default path: ~/notion-snapshots/<page_id>_<timestamp>.json
     """
@@ -640,15 +647,21 @@ def snapshot_page(page_id: str, output_path: str = "") -> str:
             ts = _time.strftime("%Y%m%d_%H%M%S")
             output_path = os.path.join(snap_dir, f"{page_id}_{ts}.json")
 
-        snapshot = client.snapshot_page(page_id, output_path)
+        snapshot = client.snapshot_page(
+            page_id, output_path, include_files=include_files
+        )
         block_count = _count_blocks(snapshot.get("blocks", []))
-        return json.dumps({
+        result = {
             "status": "ok",
             "page_id": page_id,
             "block_count": block_count,
             "snapshot_path": output_path,
             "snapshot_time": snapshot.get("snapshot_time", ""),
-        })
+        }
+        if include_files:
+            result["files_saved"] = snapshot.get("files_saved", 0)
+            result["files_failed"] = snapshot.get("files_failed", 0)
+        return json.dumps(result)
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -662,9 +675,16 @@ def restore_page_from_snapshot(page_id: str, snapshot_path: str) -> str:
     failed restore leaves the page as it was.
 
     Blocks the API cannot recreate (subpages, inline databases, Notion-hosted
-    files) are never deleted: they stay on the page above the restored
-    content and are counted in ``preserved``. Snapshot blocks that could not
-    be recreated are counted in ``skipped``.
+    files) are never deleted. For each one in the snapshot:
+
+    - Still on the page: left untouched, with the restored content written
+      around it in snapshot order (``preserved``). If it was moved so the
+      order cannot be kept, it stays put (``out_of_order``).
+    - Saved with the snapshot (include_files): uploaded again in place
+      (``uploaded``).
+    - In Notion's trash (about 30 days): brought back, at the end of the
+      page (``restored_from_trash``).
+    - Otherwise it cannot be restored (``skipped``).
 
     Args:
         page_id: The page to restore into.

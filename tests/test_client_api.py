@@ -1,5 +1,6 @@
 """Client behaviour against a mocked HTTP layer."""
 
+import json
 from unittest.mock import MagicMock
 
 import pytest
@@ -35,35 +36,74 @@ class FakeNotion:
         self.children: dict[str, list[dict]] = {"page": list(existing or [])}
         self.requests: list[tuple[str, list[dict]]] = []
         self.deleted: list[str] = []
+        self.trash: dict[str, dict] = {}
+        self.untrashed: list[str] = []
         self.fail_on_call = fail_on_call
         self.counter = 0
         client.append_children = self.append
+        client.get_block = self.get_block
+        client.restore_page = self.untrash
+        client._patch = lambda path, body: self.untrash(path.rsplit("/", 1)[-1])
         client.get_block_children = lambda bid: list(self.children.get(bid, []))
         client.get_block_children_deep = lambda bid, max_depth=10: list(self.children.get(bid, []))
         client.delete_block = self.delete
 
-    def _store(self, parent, block):
+    def _store(self, parent, block, index=None):
         self.counter += 1
         new_id = f"new{self.counter}"
         stored = {**block, "id": new_id}
-        self.children.setdefault(parent, []).append(stored)
+        siblings = self.children.setdefault(parent, [])
+        siblings.insert(len(siblings) if index is None else index, stored)
         for kid in block[block["type"]].get("children", []) or []:
             self._store(new_id, kid)
         return stored
 
-    def append(self, parent, blocks):
+    def append(self, parent, blocks, after=None, at_start=False):
         self.requests.append((parent, blocks))
         if self.fail_on_call == len(self.requests):
             raise NotionAPIError(400, "validation_error", "boom", "PATCH", "/x")
-        for b in blocks:
+        index = None
+        if after:
+            index = [k["id"] for k in self.children[parent]].index(after) + 1
+        elif at_start:
+            index = 0
+        stored = []
+        for offset, b in enumerate(blocks):
             assert payload_depth(b) <= 3, "more than two nested levels in one request"
             assert len(b[b["type"]].get("children", []) or []) <= 100
-        return [self._store(parent, b) for b in blocks]
+            stored.append(self._store(parent, b, None if index is None else index + offset))
+        return stored
 
     def delete(self, block_id):
         self.deleted.append(block_id)
         for kids in self.children.values():
+            for k in kids:
+                if k["id"] == block_id:
+                    self.trash[block_id] = {**k, "archived": True, "parent": {"page_id": "page"}}
             kids[:] = [k for k in kids if k["id"] != block_id]
+
+    def get_block(self, block_id):
+        if block_id in self.trash:
+            return self.trash[block_id]
+        for kids in self.children.values():
+            for k in kids:
+                if k["id"] == block_id:
+                    return {**k, "archived": False, "parent": {"page_id": "page"}}
+        raise NotionAPIError(404, "object_not_found", "gone", "GET", "/x")
+
+    def untrash(self, block_id):
+        """Notion returns a block restored from trash to the end of its parent."""
+        block = self.trash.pop(block_id)
+        self.untrashed.append(block_id)
+        self.children["page"].append({k: v for k, v in block.items() if k not in ("archived", "parent")})
+        return block
+
+    def order(self, parent="page"):
+        return [
+            "".join(r["text"]["content"] for r in b[b["type"]]["rich_text"])
+            if b["type"] == "paragraph" else b["id"]
+            for b in self.children.get(parent, [])
+        ]
 
     def texts(self, parent="page"):
         out = []
@@ -317,7 +357,7 @@ class TestRestore:
         assert result["preserved"] == {"child_page": 1, "child_database": 1, "image": 2}
         assert result["skipped"] == {"child_page": 1}
         assert {b["id"] for b in fake.children["page"]} >= {"sub", "db", "img", "tog"}
-        assert fake.texts()[-2:] == ["restored 1", "restored 2"]
+        assert fake.order() == ["restored 1", "restored 2", "sub", "db", "img", "tog"]
 
     def test_failed_write_rolls_back_and_keeps_old_content(self, client):
         many = {"blocks": [nested_bullets(1, 5)]}
@@ -337,6 +377,177 @@ class TestRestore:
         fake = FakeNotion(client)
         result = client.restore_page_from_snapshot("page", "~/snaps/s.json")
         assert result["created"] == 1 and fake.texts() == ["héllo ✓"]
+
+
+def subpage(block_id: str) -> dict:
+    return {"id": block_id, "type": "child_page", "child_page": {"title": block_id}}
+
+
+def hosted(block_id: str, btype: str = "image", **extra) -> dict:
+    return {"id": block_id, "type": btype, btype: {"type": "file", "file": {"url": f"https://files.example/{block_id}/pic.png?sig=1"}, **extra}}
+
+
+class TestRestoreOrder:
+    def test_content_is_written_around_kept_blocks(self, client):
+        existing = [para("old 1", "o1"), subpage("sub"), para("old 2", "o2"), hosted("img"), para("old 3", "o3")]
+        snapshot = {"blocks": [para("r1"), subpage("sub"), para("r2"), para("r3"), hosted("img"), para("r4")]}
+        fake = FakeNotion(client, existing)
+        result = client.restore_page_from_snapshot("page", snapshot)
+        assert fake.order() == ["r1", "sub", "r2", "r3", "img", "r4"]
+        assert sorted(fake.deleted) == ["o1", "o2", "o3"]
+        assert result["created"] == 4 and result["out_of_order"] == {} and result["skipped"] == {}
+        assert result["preserved"] == {"child_page": 1, "image": 1}
+
+    def test_kept_block_moved_out_of_order_is_reported_not_moved(self, client):
+        fake = FakeNotion(client, [hosted("img"), subpage("sub")])
+        result = client.restore_page_from_snapshot("page", {"blocks": [subpage("sub"), para("r1"), hosted("img")]})
+        assert fake.order() == ["img", "sub", "r1"]
+        assert result["out_of_order"] == {"image": 1}
+        assert fake.deleted == [] and fake.untrashed == []
+
+    def test_kept_block_added_after_snapshot_stays(self, client):
+        fake = FakeNotion(client, [subpage("newer"), para("old", "o1")])
+        result = client.restore_page_from_snapshot("page", {"blocks": [para("r1")]})
+        assert fake.order() == ["r1", "newer"] and result["preserved"] == {"child_page": 1}
+
+
+class TestRestoreFromTrash:
+    def _trashed(self, fake, block, parent="page"):
+        fake.trash[block["id"]] = {**block, "archived": True, "parent": {"page_id": parent}}
+
+    def test_trashed_blocks_come_back(self, client):
+        fake = FakeNotion(client, [para("old", "o1")])
+        self._trashed(fake, subpage("sub"))
+        self._trashed(fake, hosted("img"))
+        snapshot = {"blocks": [para("r1"), subpage("sub"), para("r2"), hosted("img"), para("r3")]}
+        result = client.restore_page_from_snapshot("page", snapshot)
+        assert fake.order() == ["r1", "sub", "r2", "img", "r3"]
+        assert result["restored_from_trash"] == {"child_page": 1, "image": 1}
+        assert result["skipped"] == {} and fake.deleted == ["o1"]
+
+    def test_block_kept_on_page_after_a_trash_restore_is_out_of_order(self, client):
+        fake = FakeNotion(client, [subpage("b")])
+        self._trashed(fake, subpage("a"))
+        result = client.restore_page_from_snapshot("page", {"blocks": [subpage("a"), subpage("b")]})
+        assert fake.order() == ["b", "a"]
+        assert result["out_of_order"] == {"child_page": 1}
+
+    def test_toggle_holding_a_hosted_file_is_restored_whole(self, client):
+        toggle = {"id": "tog", "type": "toggle", "toggle": {"rich_text": []}, "children": [hosted("img")]}
+        fake = FakeNotion(client)
+        self._trashed(fake, toggle)
+        result = client.restore_page_from_snapshot("page", {"blocks": [toggle]})
+        assert fake.order() == ["tog"] and result["restored_from_trash"] == {"toggle": 1}
+
+    def test_not_restored_when_gone_moved_elsewhere_or_live_elsewhere(self, client):
+        fake = FakeNotion(client)
+        self._trashed(fake, subpage("moved"), parent="other-page")
+        fake.children["elsewhere"] = [subpage("live")]
+        snapshot = {"blocks": [subpage("purged"), subpage("moved"), subpage("live"), {"type": "child_page", "child_page": {}}]}
+        result = client.restore_page_from_snapshot("page", snapshot)
+        assert result["skipped"] == {"child_page": 4} and result["restored_from_trash"] == {}
+        assert fake.untrashed == [] and fake.order() == []
+
+    def test_dashed_and_undashed_page_ids_match(self, client):
+        fake = FakeNotion(client)
+        self._trashed(fake, subpage("sub"), parent="ab-cd")
+        fake.children["abcd"] = fake.children["page"]
+        assert client.restore_page_from_snapshot("abcd", {"blocks": [subpage("sub")]})["restored_from_trash"] == {"child_page": 1}
+
+    def test_failed_restore_puts_trashed_block_back_in_trash(self, client):
+        fake = FakeNotion(client, [para("old", "o1")], fail_on_call=1)
+        self._trashed(fake, subpage("sub"))
+        with pytest.raises(NotionAPIError):
+            client.restore_page_from_snapshot("page", {"blocks": [subpage("sub"), para("r1")]})
+        assert fake.order() == ["old"] and "sub" in fake.trash
+
+
+class TestSnapshotFiles:
+    def _snapshot(self, client, tmp_path, monkeypatch, blocks, fail=False):
+        import httpx
+        got = MagicMock(return_value=httpx.Response(500 if fail else 200, content=b"PNGBYTES", request=httpx.Request("GET", "https://x")))
+        monkeypatch.setattr("notion_mcp.client.httpx.get", got)
+        client.get_page = MagicMock(return_value={"id": "page"})
+        client.get_block_children_deep = MagicMock(return_value=blocks)
+        path = tmp_path / "snap.json"
+        return client.snapshot_page("page", str(path), include_files=True), path
+
+    def test_snapshot_saves_hosted_files_at_any_depth(self, client, tmp_path, monkeypatch):
+        blocks = [
+            hosted("img"),
+            hosted("doc", "file", name="../report.pdf"),
+            {"id": "tog", "type": "toggle", "toggle": {"rich_text": []}, "children": [hosted("deep", "pdf")]},
+            {"id": "ext", "type": "image", "image": {"type": "external", "external": {"url": "https://e/x.png"}}},
+            para("text", "p1"),
+        ]
+        snap, path = self._snapshot(client, tmp_path, monkeypatch, blocks)
+        files = tmp_path / "snap.files"
+        assert snap["files_saved"] == 3 and snap["files_failed"] == 0
+        assert (files / "img" / "pic.png").read_bytes() == b"PNGBYTES"
+        assert (files / "doc" / "report.pdf").exists() and (files / "deep" / "pic.png").exists()
+        saved = json.loads(path.read_text())["blocks"]
+        assert saved[0]["snapshot_file"] == "img/pic.png" and "snapshot_file" not in saved[3]
+
+    def test_failed_download_is_counted(self, client, tmp_path, monkeypatch):
+        snap, _ = self._snapshot(client, tmp_path, monkeypatch, [hosted("img")], fail=True)
+        assert snap["files_saved"] == 0 and snap["files_failed"] == 1
+        assert "snapshot_file" not in snap["blocks"][0]
+
+    def test_include_files_needs_a_path(self, client):
+        with pytest.raises(ValueError):
+            client.snapshot_page("page", include_files=True)
+
+    def test_restore_uploads_saved_files_in_place(self, client, tmp_path, monkeypatch):
+        blocks = [para("a", "p1"), hosted("img", caption=[text("cap")]), para("b", "p2"),
+                  {"id": "tog", "type": "toggle", "toggle": {"rich_text": []}, "children": [hosted("doc", "file", name="r.pdf")]}]
+        _, path = self._snapshot(client, tmp_path, monkeypatch, blocks)
+        fake = FakeNotion(client, [para("old", "o1")])
+        client.upload_file = MagicMock(side_effect=lambda p: {"id": "up-" + p.rsplit("/", 1)[-1]})
+        result = client.restore_page_from_snapshot("page", str(path))
+        page = fake.children["page"]
+        assert [b["type"] for b in page] == ["paragraph", "image", "paragraph", "toggle"]
+        assert page[1]["image"] == {"type": "file_upload", "file_upload": {"id": "up-pic.png"}, "caption": [{"type": "text", "text": {"content": "cap"}}]}
+        nested = fake.children[page[3]["id"]][0]["file"]
+        assert nested["file_upload"] == {"id": "up-r.pdf"} and nested["name"] == "r.pdf"
+        assert result["uploaded"] == 2 and result["skipped"] == {} and fake.untrashed == []
+
+    def test_block_still_on_page_is_kept_not_uploaded(self, client, tmp_path, monkeypatch):
+        _, path = self._snapshot(client, tmp_path, monkeypatch, [hosted("img")])
+        fake = FakeNotion(client, [hosted("img")])
+        client.upload_file = MagicMock()
+        result = client.restore_page_from_snapshot("page", str(path))
+        assert fake.order() == ["img"] and result["uploaded"] == 0
+        client.upload_file.assert_not_called()
+
+    def test_file_outside_snapshot_folder_is_never_uploaded(self, client, tmp_path, monkeypatch):
+        (tmp_path / "secret.txt").write_text("secret")
+        _, path = self._snapshot(client, tmp_path, monkeypatch, [hosted("img")])
+        data = json.loads(path.read_text())
+        data["blocks"][0]["snapshot_file"] = "../secret.txt"
+        path.write_text(json.dumps(data))
+        FakeNotion(client)
+        client.upload_file = MagicMock()
+        result = client.restore_page_from_snapshot("page", str(path))
+        assert result["skipped"] == {"image": 1}
+        client.upload_file.assert_not_called()
+
+    def test_oversized_or_rejected_upload_falls_back(self, client, tmp_path, monkeypatch):
+        _, path = self._snapshot(client, tmp_path, monkeypatch, [hosted("img")])
+        fake = FakeNotion(client)
+        fake.trash["img"] = {**hosted("img"), "archived": True, "parent": {"page_id": "page"}}
+        client.upload_file = MagicMock(side_effect=NotionAPIError(400, "validation_error", "too large", "POST", "/file_uploads"))
+        result = client.restore_page_from_snapshot("page", str(path))
+        assert result["restored_from_trash"] == {"image": 1} and result["uploaded"] == 0
+        monkeypatch.setattr("notion_mcp.client.MAX_UPLOAD_BYTES", 3)
+        client.upload_file = MagicMock()
+        FakeNotion(client)
+        assert client.restore_page_from_snapshot("page", str(path))["skipped"] == {"image": 1}
+        client.upload_file.assert_not_called()
+
+    def test_snapshot_dict_has_no_files_folder(self, client):
+        FakeNotion(client)
+        block = {**hosted("img"), "snapshot_file": "img/pic.png"}
+        assert client.restore_page_from_snapshot("page", {"blocks": [block]})["skipped"] == {"image": 1}
 
 
 class TestCopy:
@@ -445,10 +656,22 @@ class TestPagesAndBlocks:
         assert len(created) == 230
         assert [len(c.args[1]["children"]) for c in client._patch.call_args_list] == [100, 100, 30]
 
+    def test_append_children_positions(self, client):
+        # Notion returns the new blocks followed by the siblings after them.
+        client._patch = MagicMock(side_effect=lambda path, body: {"results": [{"id": f"n{i}"} for i in range(len(body["children"]))] + [{"id": "old-sibling"}]})
+        created = client.append_children("p", [para("x")] * 150, after="anchor")
+        assert len(created) == 150 and "old-sibling" not in [b["id"] for b in created]
+        assert [c.args[1].get("after") for c in client._patch.call_args_list] == ["anchor", "n99"]
+        client._patch.reset_mock()
+        client.append_children("p", [para("x")] * 150, at_start=True)
+        first, second = (c.args[1] for c in client._patch.call_args_list)
+        assert first["position"] == {"type": "start"} and "after" not in first
+        assert second["after"] == "n99" and "position" not in second
+
     def test_insert_after_and_prepend(self, client):
         client.get_block = MagicMock(return_value={"parent": {"page_id": "par"}})
-        client._patch = MagicMock(return_value={"results": [{"id": "n"}]})
-        client.insert_blocks_after("b", [para("x")])
+        client._patch = MagicMock(return_value={"results": [{"id": "n"}, {"id": "old-sibling"}]})
+        assert client.insert_blocks_after("b", [para("x")]) == [{"id": "n"}]
         assert client._patch.call_args.args == ("/blocks/par/children", {"children": [para("x")], "after": "b"})
         client.prepend_children("par", [para("x")])
         assert client._patch.call_args.args[1]["position"] == {"type": "start"}
@@ -531,6 +754,16 @@ class TestFiles:
             client.upload_file(str(tmp_path / "missing.png"))
         with pytest.raises(FileNotFoundError):
             client.send_file_upload("up1", str(tmp_path / "missing.png"))
+
+    def test_content_type_names_notion_accepts(self, tmp_path):
+        from notion_mcp.client import guess_content_type
+        assert guess_content_type(tmp_path / "a.wav") == "audio/wav"
+        assert guess_content_type(tmp_path / "a.png") == "image/png"
+        assert guess_content_type(tmp_path / "a.unknownext") is None
+
+    def test_uploaded_media_converts_for_write(self):
+        block = {"type": "file", "file": {"type": "file_upload", "file_upload": {"id": "u1"}, "name": "r.pdf"}}
+        assert NotionClient.convert_block_for_write(block)["file"] == {"type": "file_upload", "file_upload": {"id": "u1"}, "name": "r.pdf"}
 
     def test_download(self, client, tmp_path, monkeypatch):
         import httpx

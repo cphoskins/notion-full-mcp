@@ -250,13 +250,48 @@ def main() -> int:
             record("restore_page_from_snapshot succeeds", r.get("status") == "ok", str(r.get("message", {k: r.get(k) for k in ("created", "deleted", "preserved", "skipped")})))
             after_types = types(c, scratch)
             record("restore: nothing lost, junk removed", Counter(after_types) == Counter(before_types) and "JUNK added after snapshot" not in texts(c, scratch), f"before={dict(Counter(before_types))} after={dict(Counter(after_types))}")
-            kept = [b for b in snapshot if not NotionClient.unsupported_block_types([b])]
-            restorable_order = [t for t in after_types if t not in ("child_page", "child_database")]
-            record("restore: content order matches snapshot", restorable_order == [b["type"] for b in kept])
+            record("restore: full page order matches snapshot", after_types == before_types and r.get("out_of_order") == {}, f"out_of_order={r.get('out_of_order')}")
+            kept_ids = [b["id"] for b in snapshot if NotionClient.unsupported_block_types([b])]
+            record("restore: kept blocks are the same blocks", set(kept_ids) <= {b["id"] for b in c.get_block_children(scratch)})
             record("restore: subpages and databases untouched", not any(c.get_page(ids[k])["archived"] for k in subpages) and c.get_database(ids["db"]).get("archived") is False)
             deep = [b for b in c.get_block_children(scratch) if b["type"] == "bulleted_list_item"][-1]
             table = [b for b in c.get_block_children(scratch) if b["type"] == "table"][-1]
             record("restore: 5-level list and 150-row table intact", bullet_chain(c, deep["id"]) == 5 and len(c.get_block_children(table["id"])) == 150)
+
+        @check("restore from trash and from saved files")
+        def _():
+            lab = tool("create_page", scratch, "Restore lab")["id"]
+            png = f"{tmp}/lab.png"
+            write_png(png, b"\x10\x80\xf0")
+            c.append_children(lab, [para("lab one")])
+            image = tool("upload_image_as_block", png, parent_id=lab)["block_id"]
+            c.append_children(lab, [para("lab two")])
+            sub = tool("create_page", lab, "Lab subpage")["id"]
+            c.append_children(lab, [para("lab three"), para("lab four")])
+            before = types(c, lab)
+
+            # 1. Saved files: the image is recreated in place, the subpage comes back from trash.
+            snap_path = f"{tmp}/lab.json"
+            s = tool("snapshot_page", lab, snap_path, include_files=True)
+            record("snapshot_page include_files saves hosted files", s.get("files_saved") == 1 and s.get("files_failed") == 0, f"saved={s.get('files_saved')}")
+            tool("delete_block", image)
+            c.update_page(sub, archived=True)
+            tool("delete_block", c.get_block_children(lab)[1]["id"])
+            r = tool("restore_page_from_snapshot", lab, snap_path)
+            record("restore: uploads saved file and restores subpage from trash", r.get("uploaded") == 1 and r.get("restored_from_trash") == {"child_page": 1} and r.get("skipped") == {}, str({k: r.get(k) for k in ("created", "uploaded", "restored_from_trash", "skipped", "out_of_order")}))
+            record("restore: order matches snapshot", types(c, lab) == before and texts(c, lab) == ["lab one", "", "lab two", "", "lab three", "lab four"], str(types(c, lab)))
+            record("restore: subpage is the same page", c.get_page(sub)["archived"] is False and sub in [b["id"] for b in c.get_block_children(lab)])
+            new_image = [b for b in c.get_block_children(lab) if b["type"] == "image"][0]["id"]
+            out = tool("download_image_block", new_image, f"{tmp}/back.png")
+            record("restore: re-uploaded image has the original bytes", open(f"{tmp}/back.png", "rb").read() == open(png, "rb").read(), str(out.get("size")))
+
+            # 2. No saved files: a deleted hosted image comes back from trash.
+            plain_path = f"{tmp}/lab-plain.json"
+            tool("snapshot_page", lab, plain_path)
+            tool("delete_block", new_image)
+            r = tool("restore_page_from_snapshot", lab, plain_path)
+            record("restore: hosted image comes back from trash", r.get("restored_from_trash") == {"image": 1} and new_image in [b["id"] for b in c.get_block_children(lab)], str(r.get("restored_from_trash")))
+            record("restore: kept subpage after a trash restore is reported", r.get("out_of_order") == {"child_page": 1} and Counter(types(c, lab)) == Counter(before), f"out_of_order={r.get('out_of_order')} order={types(c, lab)}")
     finally:
         if scratch:
             c.update_page(scratch, archived=True)

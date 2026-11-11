@@ -7,6 +7,7 @@ import time
 from collections import Counter
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -17,6 +18,7 @@ BATCH_SIZE = 100  # Notion max children per append
 MAX_NESTING = 2  # Notion max levels of nested children per request
 MAX_TEXT_LENGTH = 2000  # Notion max characters per rich text object
 MAX_RETRIES = 5  # attempts for rate-limited (429/529) requests
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # Notion single-part upload limit
 FILE_ROOT_ENV = "NOTION_MCP_FILE_ROOT"
 
 
@@ -58,6 +60,12 @@ def page_title(page: dict) -> str:
         if isinstance(prop, dict) and prop.get("type") == "title":
             return "".join(t.get("plain_text", "") for t in prop.get("title", []))
     return ""
+
+
+def guess_content_type(path: Path) -> str | None:
+    """Guess a MIME type, using the names Notion's upload API accepts."""
+    content_type, _ = mimetypes.guess_type(str(path))
+    return {"audio/x-wav": "audio/wav"}.get(content_type, content_type)
 
 
 def resolve_local_path(path: str) -> Path:
@@ -568,24 +576,37 @@ class NotionClient:
     def delete_block(self, block_id: str) -> dict:
         return self._delete(f"/blocks/{block_id}")
 
-    def append_children(self, parent_id: str, children: list[dict]) -> list[dict]:
-        """Append blocks to a parent. Handles batching for >100 blocks."""
+    def append_children(
+        self,
+        parent_id: str,
+        children: list[dict],
+        after: str | None = None,
+        at_start: bool = False,
+    ) -> list[dict]:
+        """Append blocks to a parent. Handles batching for >100 blocks.
+
+        By default blocks go at the end. ``after`` places them after that
+        sibling block; ``at_start`` places them before everything else.
+        """
         created = []
         for i in range(0, len(children), BATCH_SIZE):
             batch = children[i : i + BATCH_SIZE]
-            data = self._patch(
-                f"/blocks/{parent_id}/children", {"children": batch}
-            )
-            created.extend(data.get("results", []))
+            body: dict[str, Any] = {"children": batch}
+            if created and (after or at_start):
+                body["after"] = created[-1]["id"]
+            elif after:
+                body["after"] = after
+            elif at_start:
+                body["position"] = {"type": "start"}
+            data = self._patch(f"/blocks/{parent_id}/children", body)
+            # A positioned insert returns the new blocks followed by the
+            # siblings after them; keep only the new ones.
+            created.extend(data.get("results", [])[: len(batch)])
         return created
 
     def prepend_children(self, parent_id: str, children: list[dict]) -> list[dict]:
         """Insert up to 100 blocks at the start of a parent's children."""
-        data = self._patch(
-            f"/blocks/{parent_id}/children",
-            {"children": children[:BATCH_SIZE], "position": {"type": "start"}},
-        )
-        return data.get("results", [])
+        return self.append_children(parent_id, children[:BATCH_SIZE], at_start=True)
 
     @staticmethod
     def _inline_levels_needed(block: dict) -> int:
@@ -624,12 +645,19 @@ class NotionClient:
             pending.extend(((j, *path), ch) for path, ch in kid_pending)
         return {**block, btype: {**data, "children": new_kids}}, pending
 
-    def append_tree(self, parent_id: str, blocks: list[dict]) -> list[dict]:
+    def append_tree(
+        self,
+        parent_id: str,
+        blocks: list[dict],
+        after: str | None = None,
+        at_start: bool = False,
+    ) -> list[dict]:
         """Append write-format blocks of any depth or size.
 
         Notion accepts at most two levels of nested children and 100 children
         per list in one request. Anything beyond that is appended in follow-up
-        requests. Returns the created top-level blocks.
+        requests. ``after`` and ``at_start`` position the top-level blocks as
+        in ``append_children``. Returns the created top-level blocks.
         """
         payload, pending = [], []
         for block in blocks:
@@ -637,7 +665,7 @@ class NotionClient:
             payload.append(pruned)
             pending.append(block_pending)
 
-        created = self.append_children(parent_id, payload)
+        created = self.append_children(parent_id, payload, after, at_start)
         for top, block_pending in zip(created, pending):
             for path, children in block_pending:
                 target_id = top["id"]
@@ -657,16 +685,7 @@ class NotionClient:
         if not parent_id:
             raise ValueError(f"Cannot determine parent of block {block_id}")
 
-        all_created = []
-        for i in range(0, len(children), BATCH_SIZE):
-            batch = children[i : i + BATCH_SIZE]
-            body: dict[str, Any] = {"children": batch}
-            # Use the `after` parameter to insert after the target block
-            after_id = block_id if i == 0 else all_created[-1]["id"]
-            body["after"] = after_id
-            data = self._patch(f"/blocks/{parent_id}/children", body)
-            all_created.extend(data.get("results", []))
-        return all_created
+        return self.append_children(parent_id, children, after=block_id)
 
     # ── File Uploads ─────────────────────────────────────────────────
 
@@ -698,9 +717,7 @@ class NotionClient:
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        content_type, _ = mimetypes.guess_type(str(path))
-        if not content_type:
-            content_type = "application/octet-stream"
+        content_type = guess_content_type(path) or "application/octet-stream"
 
         with path.open("rb") as f:
             files = {"file": (path.name, f, content_type)}
@@ -727,7 +744,7 @@ class NotionClient:
         path = resolve_local_path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
-        content_type, _ = mimetypes.guess_type(str(path))
+        content_type = guess_content_type(path)
         upload = self.create_file_upload(
             filename=path.name,
             content_type=content_type,
@@ -1087,15 +1104,19 @@ class NotionClient:
             return result
 
         elif btype in cls.MEDIA_BLOCK_TYPES:
-            # Only externally hosted media can be recreated from a read.
+            # Externally hosted media can be recreated from a read. Notion-hosted
+            # media only once its bytes have been uploaded again (file_upload).
             url = (bdata.get("external") or {}).get("url", "")
-            if bdata.get("type") != "external" or not url:
+            upload_id = (bdata.get("file_upload") or {}).get("id", "")
+            if bdata.get("type") == "external" and url:
+                source = {"type": "external", "external": {"url": url}}
+            elif bdata.get("type") == "file_upload" and upload_id:
+                source = {"type": "file_upload", "file_upload": {"id": upload_id}}
+            else:
                 return None
-            result = {
-                "object": "block",
-                "type": btype,
-                btype: {"type": "external", "external": {"url": url}},
-            }
+            result = {"object": "block", "type": btype, btype: source}
+            if btype == "file" and bdata.get("name"):
+                result[btype]["name"] = bdata["name"]
             if bdata.get("caption"):
                 result[btype]["caption"] = cls.convert_rich_text_for_write(
                     bdata["caption"]
@@ -1379,11 +1400,53 @@ class NotionClient:
 
     # ── Snapshot / Restore ───────────────────────────────────────────
 
-    def snapshot_page(self, page_id: str, output_path: str | None = None) -> dict:
+    @staticmethod
+    def _snapshot_files_dir(snapshot_path: Path) -> Path:
+        """Folder holding the file bytes saved alongside a snapshot JSON."""
+        return snapshot_path.with_suffix(".files")
+
+    def _save_snapshot_files(self, blocks: list[dict], files_dir: Path) -> Counter:
+        """Download Notion-hosted media in ``blocks`` (any depth) to ``files_dir``.
+
+        Each saved block gets a ``snapshot_file`` key: its path relative to
+        ``files_dir``. Returns counts of ``saved`` and ``failed`` downloads.
+        """
+        counts: Counter = Counter()
+        for block in blocks:
+            btype = block.get("type", "")
+            bdata = block.get(btype) or {}
+            url = (bdata.get("file") or {}).get("url", "")
+            if btype in self.MEDIA_BLOCK_TYPES and bdata.get("type") == "file" and url:
+                name = Path(bdata.get("name") or unquote(urlsplit(url).path)).name
+                relative = f"{block['id']}/{name or 'file'}"
+                try:
+                    self.download_file_from_url(url, str(files_dir / relative))
+                    block["snapshot_file"] = relative
+                    counts["saved"] += 1
+                except httpx.HTTPError:
+                    counts["failed"] += 1
+            if block.get("children"):
+                counts += self._save_snapshot_files(block["children"], files_dir)
+        return counts
+
+    def snapshot_page(
+        self,
+        page_id: str,
+        output_path: str | None = None,
+        include_files: bool = False,
+    ) -> dict:
         """Create a complete snapshot of a page including all nested children.
 
         Returns the snapshot dict and optionally saves to a JSON file.
+
+        With ``include_files``, Notion-hosted images and files are downloaded
+        into a ``<snapshot name>.files`` folder beside the JSON so a restore
+        can upload them again. Without it the snapshot only holds links that
+        expire within the hour.
         """
+        if include_files and not output_path:
+            raise ValueError("include_files needs an output_path to save files beside")
+
         page = self.get_page(page_id)
         blocks = self.get_block_children_deep(page_id)
 
@@ -1397,11 +1460,77 @@ class NotionClient:
         if output_path:
             path = resolve_local_path(output_path)
             path.parent.mkdir(parents=True, exist_ok=True)
+            if include_files:
+                counts = self._save_snapshot_files(
+                    blocks, self._snapshot_files_dir(path)
+                )
+                snapshot["files_saved"] = counts["saved"]
+                snapshot["files_failed"] = counts["failed"]
             path.write_text(
                 json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8"
             )
 
         return snapshot
+
+    def _use_snapshot_files(
+        self, block: dict, files_dir: Path | None, upload: bool = False
+    ) -> dict:
+        """Return ``block`` with saved Notion-hosted media turned into uploads.
+
+        A media block whose bytes were saved with the snapshot becomes a
+        ``file_upload`` reference, which ``convert_block_for_write`` can
+        recreate. With ``upload`` false nothing is sent and the reference
+        carries a placeholder id: enough to tell whether a block could be
+        recreated.
+        """
+        if files_dir is None:
+            return block
+        btype = block.get("type", "")
+        bdata = block.get(btype) or {}
+        result = block
+        relative = block.get("snapshot_file")
+        if relative and btype in self.MEDIA_BLOCK_TYPES and bdata.get("type") == "file":
+            path = (files_dir / relative).resolve()
+            if (
+                path.is_relative_to(files_dir.resolve())
+                and path.is_file()
+                and path.stat().st_size <= MAX_UPLOAD_BYTES
+            ):
+                upload_id = self.upload_file(str(path))["id"] if upload else "pending"
+                media = {k: v for k, v in bdata.items() if k != "file"}
+                media.update(type="file_upload", file_upload={"id": upload_id})
+                result = {**block, btype: media}
+        if block.get("children"):
+            result = {
+                **result,
+                "children": [
+                    self._use_snapshot_files(child, files_dir, upload)
+                    for child in block["children"]
+                ],
+            }
+        return result
+
+    def _restore_from_trash(self, block: dict, page_id: str) -> bool:
+        """Bring a snapshot block back from Notion's trash if it is still there.
+
+        Only acts on a block that is in trash and still belongs to
+        ``page_id``. Notion puts it back at the end of the page.
+        """
+        block_id = block.get("id")
+        if not block_id:
+            return False
+        try:
+            live = self.get_block(block_id)
+            parent_id = (live.get("parent") or {}).get("page_id", "")
+            if not live.get("archived") or parent_id.replace("-", "") != page_id.replace("-", ""):
+                return False
+            if live.get("type") == "child_page":
+                self.restore_page(block_id)
+            else:
+                self._patch(f"/blocks/{block_id}", {"archived": False})
+        except NotionAPIError:
+            return False
+        return True
 
     def restore_page_from_snapshot(
         self, page_id: str, snapshot: dict | str
@@ -1414,9 +1543,18 @@ class NotionClient:
 
         Blocks that cannot be recreated through the API (subpages, inline
         databases, Notion-hosted files, synced blocks) are never deleted from
-        the page: they stay, above the restored content, and are counted in
-        ``preserved``. Snapshot blocks that cannot be recreated are counted
-        in ``skipped``.
+        the page. Each snapshot block of that kind is handled as follows:
+
+        - Still on the page: left untouched, and the restored content is
+          written around it so the snapshot order is kept. Counted in
+          ``preserved``. If it was moved so that the order can no longer be
+          kept, it stays where it is and is counted in ``out_of_order``.
+        - Its file was saved with the snapshot (``include_files``): uploaded
+          again and recreated in place. Counted in ``uploaded``.
+        - In Notion's trash: brought back. Notion returns it to the end of
+          the page, so it and everything after it in the snapshot end up
+          below the rest. Counted in ``restored_from_trash``.
+        - Otherwise it cannot be restored and is counted in ``skipped``.
 
         Args:
             page_id: The page to restore into.
@@ -1425,34 +1563,92 @@ class NotionClient:
         Returns:
             Summary of the restoration.
         """
+        files_dir = None
         if isinstance(snapshot, str):
-            snapshot = json.loads(
-                resolve_local_path(snapshot).read_text(encoding="utf-8")
-            )
-
-        snapshot_blocks = snapshot.get("blocks", [])
-        write_blocks = [
-            converted
-            for block in snapshot_blocks
-            if (converted := self.convert_block_for_write(block))
-        ]
-        skipped = self.unsupported_block_types(snapshot_blocks)
+            snapshot_path = resolve_local_path(snapshot)
+            files_dir = self._snapshot_files_dir(snapshot_path)
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
 
         current = self.get_block_children_deep(page_id)
         current_ids = {block["id"] for block in current}
         preserved: Counter = Counter()
+        anchors: dict[str, int] = {}  # kept block id -> position on the page
         to_delete: list[str] = []
-        for block in current:
+        for index, block in enumerate(current):
             unsupported = self.unsupported_block_types([block])
             if unsupported:
                 preserved += unsupported
+                anchors[block["id"]] = index
             else:
                 to_delete.append(block["id"])
 
+        skipped: Counter = Counter()
+        out_of_order: Counter = Counter()
+        from_trash: Counter = Counter()
+        counts: Counter = Counter()
+        cursor: str | None = None  # block the next write goes after
+        cursor_index = -1  # page position of the last kept block passed
+        pending: list[dict] = []
+
+        def write_pending() -> None:
+            nonlocal cursor, pending
+            blocks = [
+                converted
+                for block in pending
+                if (converted := self.convert_block_for_write(block))
+            ]
+            pending = []
+            if blocks:
+                made = self.append_tree(
+                    page_id, blocks, after=cursor, at_start=cursor is None
+                )
+                counts["created"] += len(made)
+                cursor = made[-1]["id"]
+
         try:
-            created = self.append_tree(page_id, write_blocks)
+            for block in snapshot.get("blocks", []):
+                btype = block.get("type", "unknown")
+                if not self.unsupported_block_types([block]):
+                    pending.append(block)
+                    continue
+
+                block_id = block.get("id")
+                if block_id in anchors:
+                    if anchors[block_id] > cursor_index:
+                        write_pending()
+                        cursor, cursor_index = block_id, anchors[block_id]
+                    else:
+                        out_of_order[btype] += 1
+                    continue
+
+                if not self.unsupported_block_types(
+                    [self._use_snapshot_files(block, files_dir)]
+                ):
+                    try:
+                        with_uploads = self._use_snapshot_files(
+                            block, files_dir, upload=True
+                        )
+                    except NotionAPIError:
+                        with_uploads = None  # e.g. over the workspace size limit
+                    if with_uploads:
+                        pending.append(with_uploads)
+                        counts["uploaded"] += sum(
+                            self.unsupported_block_types([block]).values()
+                        )
+                        continue
+
+                if self._restore_from_trash(block, page_id):
+                    write_pending()
+                    cursor, cursor_index = block_id, len(current)
+                    from_trash[btype] += 1
+                    continue
+
+                # Not recoverable: write what can be written, report the rest.
+                skipped += self.unsupported_block_types([block])
+                pending.append(block)
+            write_pending()
         except Exception:
-            # Roll back whatever was written; the previous content is intact.
+            # Roll back whatever was added; the previous content is intact.
             for block in self.get_block_children(page_id):
                 if block["id"] not in current_ids:
                     try:
@@ -1472,8 +1668,11 @@ class NotionClient:
         return {
             "status": "ok",
             "deleted": deleted,
-            "created": len(created),
+            "created": counts["created"],
+            "uploaded": counts["uploaded"],
             "preserved": dict(preserved),
+            "restored_from_trash": dict(from_trash),
+            "out_of_order": dict(out_of_order),
             "skipped": dict(skipped),
             "page_id": page_id,
         }

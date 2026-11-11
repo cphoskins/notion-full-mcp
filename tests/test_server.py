@@ -239,6 +239,12 @@ class TestSnapshotTools:
         assert out["snapshot_path"].startswith(str(tmp_path / "notion-snapshots"))
         assert json.load(open(out["snapshot_path"]))["page_id"] == "p"
 
+    def test_snapshot_with_files_reports_counts(self, nc, tmp_path):
+        nc.snapshot_page = MagicMock(return_value={"blocks": [], "files_saved": 2, "files_failed": 1})
+        out = run("snapshot_page", "p", str(tmp_path / "s.json"), include_files=True)
+        assert out["files_saved"] == 2 and out["files_failed"] == 1
+        assert nc.snapshot_page.call_args.kwargs == {"include_files": True}
+
     def test_restore_tool(self, nc):
         nc.restore_page_from_snapshot = MagicMock(return_value={"status": "ok", "preserved": {}, "skipped": {}})
         assert run("restore_page_from_snapshot", "p", "/tmp/s.json")["status"] == "ok"
