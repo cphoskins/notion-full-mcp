@@ -3,6 +3,13 @@
 
 Notion MCP server with deep page reading, surgical block editing, safe snapshot/restore, file uploads (Notion-hosted images and PDFs), table row manipulation, page move and copy, and page restore from trash.
 
+## What's new in v0.5.0
+
+- **Restore keeps the page in order.** Subpages, inline databases and Notion-hosted files that are still on the page stay untouched, and the restored content is written around them in snapshot order.
+- **Restore brings items back from trash.** A subpage, database or hosted file deleted after the snapshot is restored from Notion's trash with its ID, comments and history intact.
+- **Snapshots can carry files.** `snapshot_page` with `include_files` downloads Notion-hosted images and files beside the JSON, and restore uploads them again in place.
+- **Fix: inserting more than 100 blocks after a block** now keeps them in order.
+
 ## What's new in v0.4.0
 
 - **Restore can no longer lose content.** `restore_page_from_snapshot` writes the snapshot first and removes the old blocks only after that succeeds. A failed restore rolls back and leaves the page as it was. Subpages, inline databases and Notion-hosted files are never deleted.
@@ -144,8 +151,8 @@ Or for local development:
 
 | Tool | Description |
 |------|-------------|
-| `snapshot_page` | Save complete page structure as JSON |
-| `restore_page_from_snapshot` | Restore page content from a snapshot. Writes first, rolls back on failure, never deletes subpages or databases |
+| `snapshot_page` | Save complete page structure as JSON. `include_files` also saves Notion-hosted images and files |
+| `restore_page_from_snapshot` | Restore page content from a snapshot. Writes first, rolls back on failure, keeps subpages and databases in place, restores deleted ones from trash and re-uploads saved files |
 
 ### Media & Files
 
@@ -167,8 +174,13 @@ Or for local development:
 ## Block support and limits
 
 - **Round-trip (snapshot/restore and copy):** paragraph, headings (including toggleable), bulleted and numbered lists, to-do, quote, callout, toggle, code, divider, table, columns, table of contents, equation, bookmark, embed, and externally hosted image, file, video, PDF and audio blocks.
-- **Never recreated:** subpages, inline databases, synced blocks and Notion-hosted files. Restore leaves them in place on the page (reported as `preserved`); copy reports them as `skipped`.
-- **Snapshots:** record subpages and inline databases as blocks, without their own content.
+- **Never recreated from scratch:** subpages, inline databases and synced blocks. Copy reports them as `skipped`.
+- **Restore of those blocks, and of Notion-hosted files:**
+  - **Still on the page:** left untouched, with restored content written around them in snapshot order (`preserved`). One that was dragged out of snapshot order stays where it is (`out_of_order`).
+  - **File saved with the snapshot:** uploaded again and recreated in place (`uploaded`). Files over 20 MB, or over the workspace upload limit, are not uploaded.
+  - **In Notion's trash:** brought back as the same block (`restored_from_trash`). Notion returns it to the end of the page, so a block that is still on the page and came later in the snapshot ends up above it and is reported as `out_of_order`.
+  - **Gone from trash, with no saved file:** cannot be restored (`skipped`).
+- **Snapshots:** record subpages and inline databases as blocks, without their own content. Notion-hosted files are saved only with `include_files`; otherwise the snapshot holds links that expire within the hour.
 - **Queries:** `query_database` returns at most 500 rows and sets `truncated` when more matched.
 - **Find/replace:** matches within one formatting run. A phrase that spans a bold or link boundary is reported as not found.
 - **API version:** requests use Notion API version `2022-06-28`.
