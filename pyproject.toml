@@ -5,12 +5,12 @@ build-backend = "hatchling.build"
 [project]
 name = "notion-full-mcp"
 version = "0.3.1"
-description = "Full-featured Notion MCP server with deep page reading, surgical editing, snapshot/restore, file uploads (Notion-hosted images/PDFs), table row manipulation, and all block types"
+description = "Notion MCP server with deep page reading, surgical block editing, safe snapshot/restore, file uploads (Notion-hosted images/PDFs), table row manipulation, and page move/copy"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 authors = [
-    { name = "Cauldra", email = "dev@cauldra.ai" },
+    { name = "Paul Hoskins" },
 ]
 keywords = ["notion", "mcp", "model-context-protocol", "ai", "claude"]
 classifiers = [
@@ -28,6 +28,12 @@ dependencies = [
     "httpx",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest >= 8",
+    "pytest-cov",
+]
+
 [project.urls]
 Homepage = "https://github.com/cphoskins/notion-full-mcp"
 Repository = "https://github.com/cphoskins/notion-full-mcp"
@@ -38,3 +44,6 @@ packages = ["notion_mcp"]
 
 [project.scripts]
 notion-mcp = "notion_mcp.server:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

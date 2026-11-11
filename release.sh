@@ -4,7 +4,7 @@ set -euo pipefail
 # Usage: ./release.sh <version>
 # Example: ./release.sh 0.2.0
 #
-# Bumps version in all 3 files, commits, tags, and pushes.
+# Bumps version in all 3 files, refreshes uv.lock, commits, tags, and pushes.
 # Then create a GitHub Release at the printed URL to trigger PyPI publish.
 
 VERSION="${1:?Usage: ./release.sh <version>}"
@@ -37,8 +37,11 @@ grep -c "\"version\": \"${VERSION}\"" server.json | grep -q "2" || { echo "FAILE
 
 echo "Version bumped in all 3 files."
 
+# 4. uv.lock records the project version too
+uv lock
+
 # Commit, tag, push
-git add pyproject.toml notion_mcp/__init__.py server.json
+git add pyproject.toml notion_mcp/__init__.py server.json uv.lock
 git commit -m "Release v${VERSION}"
 git tag "v${VERSION}"
 git push origin main --tags
