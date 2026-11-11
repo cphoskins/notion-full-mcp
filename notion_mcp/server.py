@@ -6,14 +6,14 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-from .client import NotionClient
+from .client import NotionClient, page_title
 
 mcp = FastMCP(
     "notion-full",
     instructions=(
-        "Full-featured Notion MCP server. Supports deep page reading with "
-        "recursive children, surgical block editing, insert-at-position, "
-        "snapshot/restore, and all block types including tables."
+        "Notion MCP server for deep page reading with recursive children, "
+        "surgical block editing, insert-at-position, tables, file uploads, "
+        "page move/copy, and snapshot/restore."
     ),
 )
 
@@ -43,8 +43,7 @@ def search_pages(query: str, max_results: int = 10) -> str:
         pages = client.search_pages(query, page_size=max_results)
         results = []
         for p in pages:
-            title_parts = p.get("properties", {}).get("title", {}).get("title", [])
-            title = "".join(t.get("plain_text", "") for t in title_parts)
+            title = page_title(p)
             results.append({
                 "id": p["id"],
                 "title": title,
@@ -77,10 +76,7 @@ def search(
         for item in items:
             obj_type = item.get("object", "")
             if obj_type == "page":
-                title_parts = (
-                    item.get("properties", {}).get("title", {}).get("title", [])
-                )
-                title = "".join(t.get("plain_text", "") for t in title_parts)
+                title = page_title(item)
             else:
                 # database — title is a top-level list of rich text
                 title = "".join(
@@ -104,8 +100,7 @@ def get_page_info(page_id: str) -> str:
     try:
         client = _get_client()
         page = client.get_page(page_id)
-        title_parts = page.get("properties", {}).get("title", {}).get("title", [])
-        title = "".join(t.get("plain_text", "") for t in title_parts)
+        title = page_title(page)
         return json.dumps({
             "id": page["id"],
             "title": title,
@@ -165,10 +160,18 @@ def list_block_children(block_id: str, include_text: bool = True) -> str:
             }
             if include_text:
                 bdata = b.get(btype, {})
-                rich = bdata.get("rich_text", [])
-                entry["text"] = "".join(
-                    rt.get("plain_text", "") for rt in rich
-                )[:200]
+                if btype == "table_row":
+                    text = " | ".join(
+                        "".join(rt.get("plain_text", "") for rt in cell)
+                        for cell in bdata.get("cells", [])
+                    )
+                elif btype in ("child_page", "child_database"):
+                    text = bdata.get("title", "")
+                else:
+                    text = "".join(
+                        rt.get("plain_text", "") for rt in bdata.get("rich_text", [])
+                    )
+                entry["text"] = text[:200]
             results.append(entry)
         return json.dumps(results, indent=2)
     except Exception as e:
@@ -220,9 +223,8 @@ def find_replace_in_block(block_id: str, old_text: str, new_text: str) -> str:
             "replacements": result.get("replacements", 0),
         })
     except ValueError as e:
-        # Unicode / whitespace mismatch -- surface the diagnostic to the caller
-        # so the silent no-op that previously masked IR-R3-14 and IR-R4 fixes
-        # becomes an explicit error with a preview of the block's actual text.
+        # Text not found -- surface the diagnostic (with a preview of the
+        # block's actual text) instead of reporting a silent no-op.
         return json.dumps({
             "status": "error",
             "error_type": "text_not_found",
@@ -330,8 +332,8 @@ def upload_file(file_path: str) -> str:
     use ``upload_image_as_block`` instead.
 
     Args:
-        file_path: Local path to the file (PNG, JPEG, GIF, SVG, PDF, etc.)
-                   Files up to 20 MiB use single-part mode.
+        file_path: Local path to the file (PNG, JPEG, GIF, SVG, PDF, etc.),
+                   up to 20 MiB.
     """
     try:
         client = _get_client()
@@ -356,8 +358,8 @@ def upload_image_as_block(
 ) -> str:
     """Upload an image file to Notion and insert it as a new image block.
 
-    This is the standard replacement for imgur-hosted images. The image is
-    stored in Notion's own workspace storage.
+    The image is stored in Notion's own workspace storage, so no external
+    image host is needed.
 
     Args:
         file_path: Local path to the image (PNG, JPEG, GIF, SVG, WEBP, etc.)
@@ -400,10 +402,8 @@ def replace_image_block(
 ) -> str:
     """Replace an existing image block's content with a newly uploaded image.
 
-    Preserves the block's position in the parent by deleting the old block
-    and inserting the new one after the previous sibling. If the image block
-    is the very first child of its parent, the new block is appended to the
-    end (Notion does not support prepend-at-position).
+    Preserves the block's position in the parent: the new image is inserted
+    where the old one was and the old block is deleted. The block ID changes.
 
     Args:
         block_id: The existing image block to replace.
@@ -450,23 +450,17 @@ def replace_image_block(
         client.delete_block(block_id)
 
         if idx == 0:
-            # Notion has no prepend-at-position. Append to end with a warning.
-            created = client.append_children(parent_id, [new_block])
-            warning = "inserted at end of parent (idx=0, prepend not supported)"
+            created = client.prepend_children(parent_id, [new_block])
         else:
             anchor = siblings[idx - 1]["id"]
             created = client.insert_blocks_after(anchor, [new_block])
-            warning = ""
 
-        resp = {
+        return json.dumps({
             "status": "ok",
             "old_block_id": block_id,
             "new_block_id": created[0]["id"] if created else None,
             "file_upload_id": upload["id"],
-        }
-        if warning:
-            resp["warning"] = warning
-        return json.dumps(resp)
+        })
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 
@@ -562,8 +556,8 @@ def insert_table_row(
         cells_json: JSON array. Each element is either:
             - a plain string (single text segment)
             - a list of strings (multi-segment plain text in one cell)
-            Example for a 4-column table:
-            '["SMB", "$15K", "$0.015", "$80k - $300k"]'
+            Example for a 3-column table:
+            '["Widget", "In stock", "42"]'
         after_row_id: Optional row ID to insert after. If empty, append to end.
     """
     try:
@@ -632,6 +626,8 @@ def snapshot_page(page_id: str, output_path: str = "") -> str:
 
     Saves to a JSON file if output_path is provided. The snapshot includes
     the full block tree with recursive children, suitable for restore.
+    Subpages and inline databases are recorded as blocks but their own
+    content is not captured.
 
     Default path: ~/notion-snapshots/<page_id>_<timestamp>.json
     """
@@ -661,8 +657,14 @@ def snapshot_page(page_id: str, output_path: str = "") -> str:
 def restore_page_from_snapshot(page_id: str, snapshot_path: str) -> str:
     """Restore a page from a previously saved snapshot.
 
-    WARNING: This deletes all current content and replaces it with the snapshot.
-    Always take a snapshot of the current state before restoring.
+    Replaces the page's content with the snapshot. The snapshot is written
+    first and the previous blocks are removed only after that succeeds, so a
+    failed restore leaves the page as it was.
+
+    Blocks the API cannot recreate (subpages, inline databases, Notion-hosted
+    files) are never deleted: they stay on the page above the restored
+    content and are counted in ``preserved``. Snapshot blocks that could not
+    be recreated are counted in ``skipped``.
 
     Args:
         page_id: The page to restore into.
@@ -721,8 +723,7 @@ def create_page(
             icon=icon,
             extra_properties=extra_properties,
         )
-        title_parts = result.get("properties", {}).get("title", {}).get("title", [])
-        created_title = "".join(t.get("plain_text", "") for t in title_parts)
+        created_title = page_title(result)
         return json.dumps({
             "status": "ok",
             "id": result["id"],
@@ -744,9 +745,8 @@ def update_page(
     """Update a page's title, icon, or archive status.
 
     Only fields with non-default values are sent in the PATCH body.
-    To archive a page pass archived=True; to unarchive pass archived=False
-    (but note the server only sends archived when a caller explicitly toggles it —
-    see the implementation which guards on the sentinel value).
+    This tool can archive a page (archived=True) but never unarchives one;
+    use restore_page to bring a page back from trash.
 
     Args:
         page_id: The page to update.
@@ -794,28 +794,26 @@ def move_page(
     new_parent_id: str,
     parent_type: str = "page_id",
 ) -> str:
-    """NOT SUPPORTED: Notion's public API does not support moving a page.
+    """Move a page under a new parent page.
 
-    The PATCH /pages/{id} endpoint silently ignores parent field changes --
-    the call returns HTTP 200 but the page is not actually moved. This tool
-    is preserved only to return a clear error message and point callers to
-    the working alternatives.
+    The page keeps its ID, content, comments and subpages. Only page parents
+    are supported; to place a page in a database use copy_page_to_parent.
 
-    To move a page, use one of these instead:
-        * copy_page_to_parent -- destructive recreate-and-archive (block IDs
-          will change, file_upload media degrades to short-lived URLs)
-        * Manually drag the page in the Notion sidebar (recommended for
-          pages with nested subpages or heavy media content)
+    Args:
+        page_id: The page to move.
+        new_parent_id: The page that becomes the new parent.
+        parent_type: Must be "page_id".
     """
-    return json.dumps({
-        "status": "error",
-        "message": (
-            "move_page is not supported. Notion's public API silently ignores "
-            "parent changes on PATCH /pages/{id}. Use copy_page_to_parent "
-            "for a destructive recreate-and-archive alternative, or move the "
-            "page manually in the Notion UI."
-        ),
-    })
+    try:
+        client = _get_client()
+        result = client.move_page(page_id, new_parent_id, parent_type)
+        return json.dumps({
+            "status": "ok",
+            "id": result["id"],
+            "parent": result.get("parent", {}),
+        })
+    except Exception as e:
+        return json.dumps({"status": "error", "message": str(e)})
 
 
 @mcp.tool
@@ -853,25 +851,22 @@ def copy_page_to_parent(
     parent_type: str = "page_id",
     archive_original: bool = True,
 ) -> str:
-    """Recreate a page under a new parent (destructive workaround for move).
+    """Recreate a page under a new parent. Prefer move_page for plain moves.
 
-    Since Notion's public API does not support changing a page's parent,
-    this tool works around the limitation by creating a new page at the
-    target location with the same title, icon, and content, then archiving
-    the original.
+    Creates a new page at the target with the same title, emoji icon and
+    content, then archives the original. Use it to duplicate a page or to
+    place a page in a database.
 
     LIMITATIONS (read carefully):
-        * Block IDs of the new page are different from the original. Any
-          external references to original block IDs (graphics-spec.md,
-          cross-page links, Change Log entries) will point at the archived
-          original and need to be updated.
-        * file_upload image blocks are copied as external URL references
-          using the Notion-signed URL returned at copy time. Those URLs
-          expire within an hour. For permanent preservation, re-upload the
-          source files via upload_image_as_block after the copy.
-        * child_page descendants (nested subpages) are NOT recursively
-          copied -- the tool refuses to run if any are present. Copy them
-          individually.
+        * Block IDs of the new page differ from the original, so links to
+          the original blocks will point at the archived page.
+        * Notion-hosted images and files are copied as external references
+          to signed URLs that expire within about an hour. Re-upload the
+          source files for a permanent copy.
+        * Nested subpages are not copied; the tool refuses to run if any are
+          present.
+        * Block types that cannot be recreated are listed in ``skipped``.
+          When anything was skipped, the original is left in place.
         * Comments, page history, permissions, and synced blocks are not
           copied.
 
@@ -967,19 +962,27 @@ def query_database(
         database_id: The database to query.
         filter_json: JSON string for a Notion filter object. Leave empty for no filter.
         sorts_json: JSON string for a Notion sorts array. Leave empty for no sorting.
-        page_size: Maximum rows per page fetch (max 100). All pages are returned.
+        page_size: Maximum rows per page fetch (max 100).
+
+    Returns at most 500 rows. ``truncated`` is true when more rows matched;
+    narrow the filter to see the rest.
     """
     try:
         client = _get_client()
         filter_obj = json.loads(filter_json) if filter_json else None
         sorts = json.loads(sorts_json) if sorts_json else None
-        rows = client.query_database(
+        rows, truncated = client.query_database_page(
             database_id,
             filter=filter_obj,
             sorts=sorts,
             page_size=page_size,
         )
-        return json.dumps({"status": "ok", "count": len(rows), "results": rows}, indent=2)
+        return json.dumps({
+            "status": "ok",
+            "count": len(rows),
+            "truncated": truncated,
+            "results": rows,
+        }, indent=2)
     except Exception as e:
         return json.dumps({"status": "error", "message": str(e)})
 

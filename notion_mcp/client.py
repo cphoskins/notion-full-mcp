@@ -4,6 +4,7 @@ import json
 import mimetypes
 import os
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,63 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 RATE_LIMIT_DELAY = 0.05  # 50ms between requests
 BATCH_SIZE = 100  # Notion max children per append
+MAX_NESTING = 2  # Notion max levels of nested children per request
+MAX_TEXT_LENGTH = 2000  # Notion max characters per rich text object
+MAX_RETRIES = 5  # attempts for rate-limited (429/529) requests
+FILE_ROOT_ENV = "NOTION_MCP_FILE_ROOT"
+
+
+class NotionAPIError(Exception):
+    """A Notion API error response, carrying Notion's own code and message."""
+
+    def __init__(self, status: int, code: str, message: str, method: str, path: str):
+        self.status = status
+        self.code = code
+        self.message = message
+        super().__init__(
+            f"Notion API error {status} ({code}) on {method} {path}: {message}"
+        )
+
+
+def _raise_for_error(r: httpx.Response, method: str, path: str) -> None:
+    if not r.is_error:
+        return
+    try:
+        data = r.json()
+    except ValueError:
+        data = {}
+    raise NotionAPIError(
+        r.status_code,
+        data.get("code", "unknown_error"),
+        data.get("message") or r.text[:500],
+        method,
+        path,
+    )
+
+
+def page_title(page: dict) -> str:
+    """Plain-text title of a page, whatever its title property is called.
+
+    Pages in a database key the title by the column name (e.g. "Name"), so
+    the property is found by type, not by the literal key "title".
+    """
+    for prop in page.get("properties", {}).values():
+        if isinstance(prop, dict) and prop.get("type") == "title":
+            return "".join(t.get("plain_text", "") for t in prop.get("title", []))
+    return ""
+
+
+def resolve_local_path(path: str) -> Path:
+    """Expand ``~`` and enforce the optional NOTION_MCP_FILE_ROOT boundary."""
+    resolved = Path(path).expanduser().resolve()
+    root = os.environ.get(FILE_ROOT_ENV, "")
+    if root:
+        root_path = Path(root).expanduser().resolve()
+        if not resolved.is_relative_to(root_path):
+            raise ValueError(
+                f"Path {resolved} is outside {FILE_ROOT_ENV} ({root_path})"
+            )
+    return resolved
 
 
 class NotionClient:
@@ -35,29 +93,32 @@ class NotionClient:
 
     # ── Low-level API ────────────────────────────────────────────────
 
-    def _get(self, path: str, params: dict | None = None) -> dict:
-        r = self._http.get(path, params=params)
-        r.raise_for_status()
+    def _request(self, method: str, path: str, **kwargs) -> dict:
+        for attempt in range(1, MAX_RETRIES + 1):
+            r = self._http.request(method, path, **kwargs)
+            if r.status_code in (429, 529) and attempt < MAX_RETRIES:
+                try:
+                    delay = float(r.headers.get("Retry-After", 1))
+                except (TypeError, ValueError):
+                    delay = 1.0
+                time.sleep(delay * attempt)
+                continue
+            break
+        _raise_for_error(r, method, path)
         time.sleep(RATE_LIMIT_DELAY)
         return r.json()
+
+    def _get(self, path: str, params: dict | None = None) -> dict:
+        return self._request("GET", path, params=params)
 
     def _post(self, path: str, body: dict) -> dict:
-        r = self._http.post(path, json=body)
-        r.raise_for_status()
-        time.sleep(RATE_LIMIT_DELAY)
-        return r.json()
+        return self._request("POST", path, json=body)
 
     def _patch(self, path: str, body: dict) -> dict:
-        r = self._http.patch(path, json=body)
-        r.raise_for_status()
-        time.sleep(RATE_LIMIT_DELAY)
-        return r.json()
+        return self._request("PATCH", path, json=body)
 
     def _delete(self, path: str) -> dict:
-        r = self._http.delete(path)
-        r.raise_for_status()
-        time.sleep(RATE_LIMIT_DELAY)
-        return r.json()
+        return self._request("DELETE", path)
 
     # ── Pages ────────────────────────────────────────────────────────
 
@@ -68,7 +129,7 @@ class NotionClient:
         body = {
             "query": query,
             "filter": {"property": "object", "value": "page"},
-            "page_size": page_size,
+            "page_size": max(1, min(page_size, 100)),
         }
         return self._post("/search", body).get("results", [])
 
@@ -142,20 +203,19 @@ class NotionClient:
         new_parent_id: str,
         parent_type: str = "page_id",
     ) -> dict:
-        """NOT SUPPORTED by the Notion public API.
+        """Move a page under a new parent page, keeping its ID and content.
 
-        Notion's PATCH /pages/{id} endpoint silently ignores ``parent`` field
-        changes -- the call returns HTTP 200 but the page is not actually moved.
-        This method now raises to prevent callers from relying on broken
-        behavior. Use ``copy_page_to_parent`` for a destructive recreate-and-
-        archive alternative, or move the page manually in the Notion UI.
+        Uses ``POST /pages/{id}/move``. Only page parents are supported;
+        moving into a database is not implemented yet.
         """
-        raise NotImplementedError(
-            "Notion's public API does not support changing a page's parent "
-            "via PATCH /pages/{id}. The endpoint silently ignores the parent "
-            "field. Use copy_page_to_parent(page_id, new_parent_id) for a "
-            "destructive recreate-and-archive alternative, or move the page "
-            "manually by dragging it in the Notion sidebar."
+        if parent_type != "page_id":
+            raise ValueError(
+                "move_page supports parent_type='page_id' only. To place a "
+                "page in a database, use copy_page_to_parent."
+            )
+        return self._post(
+            f"/pages/{page_id}/move",
+            {"parent": {"type": "page_id", "page_id": new_parent_id}},
         )
 
     def restore_page(self, page_id: str) -> dict:
@@ -178,39 +238,31 @@ class NotionClient:
         parent_type: str = "page_id",
         archive_original: bool = True,
     ) -> dict:
-        """Destructively recreate a page under a new parent.
+        """Recreate a page under a new parent (use move_page when possible).
 
-        This is the workaround for Notion's public API not supporting parent
-        changes on existing pages. Creates a new page at ``new_parent_id``
-        with the same title, icon, and content, then optionally archives the
-        original.
+        Creates a new page at ``new_parent_id`` with the same title, emoji
+        icon, and content, then optionally archives the original. Useful for
+        copying, or for placing a page in a database.
 
         LIMITATIONS:
-            * Block IDs of the new page differ from the original, so any
-              external references (graphics-spec.md, cross-page block links)
-              to the original block IDs go stale.
-            * file_upload image blocks are copied as ``external`` URLs using
-              the current signed URL returned by the Notion API. Those signed
-              URLs are short-lived (~1 hour). For permanent preservation of
-              file_upload images in the copied page, re-upload the source
-              files via upload_image_as_block after the copy completes.
-            * child_page descendants (nested subpages) are NOT recursively
-              copied. If the page contains any child_page blocks, this
-              method raises to prevent silent data loss. Copy nested pages
-              individually.
+            * Block IDs of the new page differ from the original, so links
+              to the original blocks go stale.
+            * Notion-hosted images and files are copied as ``external``
+              references to Notion's signed URLs, which expire in about an
+              hour. Re-upload the source files for a permanent copy.
+            * Nested subpages are not copied. If the page contains any
+              child_page blocks, this method raises.
+            * Block types that cannot be recreated are reported in
+              ``skipped``. When anything was skipped the original is NOT
+              archived, whatever ``archive_original`` says.
             * Comments, page history, permissions, and synced blocks are not
               copied.
-            * Tables are copied with inline row children; very large tables
-              may hit Notion's 100-children-per-request limit and will be
-              split into multiple append_children batches automatically.
 
-        Returns a dict with the new page id, url, and archive status.
+        Returns a dict with the new page id, url, archive status, and any
+        skipped block types.
         """
         source = self.get_page(page_id)
-        title_parts = (
-            source.get("properties", {}).get("title", {}).get("title", [])
-        )
-        title = "".join(t.get("plain_text", "") for t in title_parts)
+        title = page_title(source)
         icon = source.get("icon")
         icon_emoji = None
         if icon and icon.get("type") == "emoji":
@@ -241,6 +293,8 @@ class NotionClient:
             if converted:
                 write_blocks.append(converted)
 
+        skipped = self.unsupported_block_types(blocks, self._convert_block_for_copy)
+
         new_page = self.create_page(
             parent_id=new_parent_id,
             title=title,
@@ -250,20 +304,36 @@ class NotionClient:
         )
         new_page_id = new_page["id"]
 
-        if write_blocks:
-            self.append_children(new_page_id, write_blocks)
+        try:
+            if write_blocks:
+                self.append_tree(new_page_id, write_blocks)
+        except Exception:
+            # Do not leave a half-written copy behind; the original is intact.
+            try:
+                self._patch(f"/pages/{new_page_id}", {"archived": True})
+            except NotionAPIError:
+                pass
+            raise
 
-        if archive_original:
+        archived = archive_original and not skipped
+        if archived:
             self._patch(f"/pages/{page_id}", {"archived": True})
 
-        return {
+        result = {
             "status": "ok",
             "new_page_id": new_page_id,
             "new_page_url": new_page.get("url", ""),
             "original_page_id": page_id,
-            "original_archived": archive_original,
+            "original_archived": archived,
             "blocks_copied": len(write_blocks),
+            "skipped": dict(skipped),
         }
+        if skipped and archive_original:
+            result["warning"] = (
+                "Some blocks could not be copied (see 'skipped'), so the "
+                "original page was left in place."
+            )
+        return result
 
     @classmethod
     def _convert_block_for_copy(cls, block: dict) -> dict | None:
@@ -327,20 +397,6 @@ class NotionClient:
                 result["file"]["name"] = bdata["name"]
             return result
 
-        if btype == "bookmark":
-            return {
-                "object": "block",
-                "type": "bookmark",
-                "bookmark": {"url": bdata.get("url", "")},
-            }
-
-        if btype == "embed":
-            return {
-                "object": "block",
-                "type": "embed",
-                "embed": {"url": bdata.get("url", "")},
-            }
-
         # Fall back to the standard converter for everything else.
         return cls.convert_block_for_write(block)
 
@@ -377,6 +433,8 @@ class NotionClient:
         """Get metadata and schema for a Notion database."""
         return self._get(f"/databases/{database_id}")
 
+    QUERY_MAX_ITEMS = 500
+
     def query_database(
         self,
         database_id: str,
@@ -386,14 +444,23 @@ class NotionClient:
     ) -> list[dict]:
         """Query a database with optional filter and sort criteria.
 
-        Handles pagination automatically, returning all matching rows up to
-        a combined ceiling of 500 items to avoid unbounded requests.
+        Handles pagination automatically, returning at most 500 rows. Use
+        ``query_database_page`` to learn whether more rows exist.
         """
-        MAX_ITEMS = 500
+        return self.query_database_page(database_id, filter, sorts, page_size)[0]
+
+    def query_database_page(
+        self,
+        database_id: str,
+        filter: dict | None = None,
+        sorts: list | None = None,
+        page_size: int = 100,
+    ) -> tuple[list[dict], bool]:
+        """Like ``query_database`` but also returns whether rows were cut off."""
         results: list[dict] = []
         cursor = None
         while True:
-            body: dict[str, Any] = {"page_size": min(page_size, 100)}
+            body: dict[str, Any] = {"page_size": max(1, min(page_size, 100))}
             if filter:
                 body["filter"] = filter
             if sorts:
@@ -402,10 +469,12 @@ class NotionClient:
                 body["start_cursor"] = cursor
             data = self._post(f"/databases/{database_id}/query", body)
             results.extend(data.get("results", []))
-            if not data.get("has_more") or len(results) >= MAX_ITEMS:
+            has_more = bool(data.get("has_more"))
+            if not has_more or len(results) >= self.QUERY_MAX_ITEMS:
                 break
             cursor = data.get("next_cursor")
-        return results
+        truncated = has_more or len(results) > self.QUERY_MAX_ITEMS
+        return results[: self.QUERY_MAX_ITEMS], truncated
 
     # ── Users ────────────────────────────────────────────────────────
 
@@ -443,7 +512,10 @@ class NotionClient:
             filter_type: "page", "database", or None (returns both).
             page_size: Maximum number of results to return.
         """
-        body: dict[str, Any] = {"query": query, "page_size": page_size}
+        body: dict[str, Any] = {
+            "query": query,
+            "page_size": max(1, min(page_size, 100)),
+        }
         if filter_type in ("page", "database"):
             body["filter"] = {"property": "object", "value": filter_type}
         return self._post("/search", body).get("results", [])
@@ -472,12 +544,15 @@ class NotionClient:
         """Recursively fetch all blocks including nested children.
 
         Each block gets a `children` key with its nested child blocks.
+        Subpages and inline databases are listed but not descended into.
         """
         if max_depth <= 0:
             return []
         blocks = self.get_block_children(block_id)
         for block in blocks:
-            if block.get("has_children"):
+            if block.get("has_children") and block.get("type") not in (
+                "child_page", "child_database",
+            ):
                 block["children"] = self.get_block_children_deep(
                     block["id"], max_depth - 1
                 )
@@ -502,6 +577,73 @@ class NotionClient:
                 f"/blocks/{parent_id}/children", {"children": batch}
             )
             created.extend(data.get("results", []))
+        return created
+
+    def prepend_children(self, parent_id: str, children: list[dict]) -> list[dict]:
+        """Insert up to 100 blocks at the start of a parent's children."""
+        data = self._patch(
+            f"/blocks/{parent_id}/children",
+            {"children": children[:BATCH_SIZE], "position": {"type": "start"}},
+        )
+        return data.get("results", [])
+
+    @staticmethod
+    def _inline_levels_needed(block: dict) -> int:
+        """Levels of children a block must carry inline when it is created."""
+        return {"table": 1, "column_list": 2, "column": 1}.get(block.get("type"), 0)
+
+    @classmethod
+    def _prune_for_request(cls, block: dict, depth: int = 0) -> tuple[dict, list]:
+        """Trim a write-format block to what one append request may carry.
+
+        Returns the trimmed block and a list of ``(path, children)`` pairs:
+        children that must be appended afterwards to the descendant reached
+        by following ``path`` (child indexes) from this block.
+        """
+        btype = block.get("type", "")
+        data = block.get(btype) or {}
+        kids = data.get("children") or []
+        if not kids:
+            return block, []
+
+        def without_children() -> dict:
+            return {**block, btype: {k: v for k, v in data.items() if k != "children"}}
+
+        too_deep = depth >= MAX_NESTING or any(
+            depth + 1 + cls._inline_levels_needed(k) > MAX_NESTING for k in kids
+        )
+        if too_deep and not cls._inline_levels_needed(block):
+            return without_children(), [((), kids)]
+
+        keep, extra = kids[:BATCH_SIZE], kids[BATCH_SIZE:]
+        pending: list = [((), extra)] if extra else []
+        new_kids = []
+        for j, kid in enumerate(keep):
+            pruned, kid_pending = cls._prune_for_request(kid, depth + 1)
+            new_kids.append(pruned)
+            pending.extend(((j, *path), ch) for path, ch in kid_pending)
+        return {**block, btype: {**data, "children": new_kids}}, pending
+
+    def append_tree(self, parent_id: str, blocks: list[dict]) -> list[dict]:
+        """Append write-format blocks of any depth or size.
+
+        Notion accepts at most two levels of nested children and 100 children
+        per list in one request. Anything beyond that is appended in follow-up
+        requests. Returns the created top-level blocks.
+        """
+        payload, pending = [], []
+        for block in blocks:
+            pruned, block_pending = self._prune_for_request(block)
+            payload.append(pruned)
+            pending.append(block_pending)
+
+        created = self.append_children(parent_id, payload)
+        for top, block_pending in zip(created, pending):
+            for path, children in block_pending:
+                target_id = top["id"]
+                for index in path:
+                    target_id = self.get_block_children(target_id)[index]["id"]
+                self.append_tree(target_id, children)
         return created
 
     def insert_blocks_after(self, block_id: str, children: list[dict]) -> list[dict]:
@@ -552,7 +694,7 @@ class NotionClient:
         Uses multipart/form-data (not JSON), so bypasses the default
         ``Content-Type: application/json`` header on ``self._http``.
         """
-        path = Path(file_path).expanduser()
+        path = resolve_local_path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
@@ -572,7 +714,7 @@ class NotionClient:
                 files=files,
                 timeout=120.0,
             )
-        r.raise_for_status()
+        _raise_for_error(r, "POST", f"/file_uploads/{upload_id}/send")
         time.sleep(RATE_LIMIT_DELAY)
         return r.json()
 
@@ -582,7 +724,7 @@ class NotionClient:
         Use the returned ``id`` in image/file/pdf blocks via ``make_image_block``
         or by constructing a block with ``{"type": "file_upload", "file_upload": {"id": ...}}``.
         """
-        path = Path(file_path).expanduser()
+        path = resolve_local_path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
         content_type, _ = mimetypes.guess_type(str(path))
@@ -663,7 +805,7 @@ class NotionClient:
 
     def download_file_from_url(self, url: str, output_path: str) -> dict:
         """Download a file from any URL (external or Notion-hosted signed) to disk."""
-        out = Path(output_path).expanduser()
+        out = resolve_local_path(output_path)
         out.parent.mkdir(parents=True, exist_ok=True)
         r = httpx.get(url, timeout=120.0, follow_redirects=True)
         r.raise_for_status()
@@ -816,19 +958,48 @@ class NotionClient:
             rt["text"]["link"] = {"url": link}
         return rt
 
-    @staticmethod
-    def convert_rich_text_for_write(rich_texts: list[dict]) -> list[dict]:
-        """Convert read-format rich_text to write-format, preserving all annotations."""
+    @classmethod
+    def make_rich_text_list(cls, content: str) -> list[dict]:
+        """Plain text as rich text, split to respect Notion's 2000-char limit."""
+        chunks = [
+            content[i : i + MAX_TEXT_LENGTH]
+            for i in range(0, len(content), MAX_TEXT_LENGTH)
+        ] or [""]
+        return [cls.make_rich_text(chunk) for chunk in chunks]
+
+    WRITABLE_MENTION_TYPES = ("user", "page", "database", "date")
+
+    @classmethod
+    def convert_rich_text_for_write(cls, rich_texts: list[dict]) -> list[dict]:
+        """Convert read-format rich_text to write-format.
+
+        Keeps annotations and links. User, page, database and date mentions
+        and inline equations are passed through as-is; other non-text
+        segments (link previews, template mentions) fall back to plain text.
+        """
         result = []
         for rt in rich_texts:
-            item: dict[str, Any] = {
-                "type": "text",
-                "text": {"content": rt.get("plain_text", "")},
-            }
+            rtype = rt.get("type", "text")
+            item: dict[str, Any] | None = None
+            if rtype == "equation" and rt.get("equation"):
+                item = {"type": "equation", "equation": rt["equation"]}
+            elif rtype == "mention":
+                mention = rt.get("mention") or {}
+                mtype = mention.get("type", "")
+                if mtype in cls.WRITABLE_MENTION_TYPES and mention.get(mtype):
+                    value = mention[mtype]
+                    if mtype != "date":
+                        value = {"id": value.get("id", "")}
+                    item = {"type": "mention", "mention": {"type": mtype, mtype: value}}
+            if item is None:
+                item = {"type": "text", "text": {"content": rt.get("plain_text", "")}}
+                link = (rt.get("text") or {}).get("link")
+                if not link and rtype != "text" and rt.get("href"):
+                    link = {"url": rt["href"]}
+                if link:
+                    item["text"]["link"] = link
             if rt.get("annotations"):
                 item["annotations"] = rt["annotations"]
-            if rt.get("text", {}).get("link"):
-                item["text"]["link"] = rt["text"]["link"]
             result.append(item)
         return result
 
@@ -839,6 +1010,21 @@ class NotionClient:
         "bulleted_list_item", "numbered_list_item", "quote",
         "callout", "toggle", "to_do",
     }
+
+    MEDIA_BLOCK_TYPES = ("image", "file", "video", "pdf", "audio")
+
+    @classmethod
+    def unsupported_block_types(cls, blocks: list[dict], converter=None) -> Counter:
+        """Count blocks (at any depth) that ``converter`` cannot recreate."""
+        converter = converter or cls.convert_block_for_write
+        skipped: Counter = Counter()
+        for block in blocks:
+            shallow = {k: v for k, v in block.items() if k != "children"}
+            if converter(shallow) is None:
+                skipped[block.get("type", "unknown")] += 1
+            elif block.get("children"):
+                skipped += cls.unsupported_block_types(block["children"], converter)
+        return skipped
 
     @classmethod
     def convert_block_for_write(cls, block: dict) -> dict | None:
@@ -865,6 +1051,8 @@ class NotionClient:
                 result[btype]["checked"] = bdata["checked"]
             if btype == "callout" and "icon" in bdata:
                 result[btype]["icon"] = bdata["icon"]
+            if btype.startswith("heading_") and bdata.get("is_toggleable"):
+                result[btype]["is_toggleable"] = True
 
             # Handle children (for toggles, list items with sub-items, etc.)
             if block.get("children"):
@@ -880,6 +1068,39 @@ class NotionClient:
 
         elif btype == "divider":
             return {"object": "block", "type": "divider", "divider": {}}
+
+        elif btype == "equation":
+            return {
+                "object": "block",
+                "type": "equation",
+                "equation": {"expression": bdata.get("expression", "")},
+            }
+
+        elif btype in ("bookmark", "embed"):
+            if not bdata.get("url"):
+                return None
+            result = {"object": "block", "type": btype, btype: {"url": bdata["url"]}}
+            if bdata.get("caption"):
+                result[btype]["caption"] = cls.convert_rich_text_for_write(
+                    bdata["caption"]
+                )
+            return result
+
+        elif btype in cls.MEDIA_BLOCK_TYPES:
+            # Only externally hosted media can be recreated from a read.
+            url = (bdata.get("external") or {}).get("url", "")
+            if bdata.get("type") != "external" or not url:
+                return None
+            result = {
+                "object": "block",
+                "type": btype,
+                btype: {"type": "external", "external": {"url": url}},
+            }
+            if bdata.get("caption"):
+                result[btype]["caption"] = cls.convert_rich_text_for_write(
+                    bdata["caption"]
+                )
+            return result
 
         elif btype == "table_of_contents":
             return {
@@ -993,14 +1214,14 @@ class NotionClient:
                 "object": "block",
                 "type": "code",
                 "code": {
-                    "rich_text": [cls.make_rich_text(text)],
+                    "rich_text": cls.make_rich_text_list(text),
                     "language": kwargs.get("language", "plain text"),
                 },
             }
 
         if block_type in cls.RICH_TEXT_BLOCK_TYPES:
             block_data: dict[str, Any] = {
-                "rich_text": [cls.make_rich_text(text)],
+                "rich_text": cls.make_rich_text_list(text),
             }
             if "color" in kwargs:
                 block_data["color"] = kwargs["color"]
@@ -1028,13 +1249,13 @@ class NotionClient:
         if btype in self.RICH_TEXT_BLOCK_TYPES:
             return self.update_block(block_id, {
                 btype: {
-                    "rich_text": [self.make_rich_text(new_text)],
+                    "rich_text": self.make_rich_text_list(new_text),
                 }
             })
         elif btype == "code":
             return self.update_block(block_id, {
                 "code": {
-                    "rich_text": [self.make_rich_text(new_text)],
+                    "rich_text": self.make_rich_text_list(new_text),
                     "language": bdata.get("language", "plain text"),
                 }
             })
@@ -1072,19 +1293,11 @@ class NotionClient:
         updated = []
         total_replacements = 0
         for rt in rich_texts:
-            original = rt.get("plain_text", "")
-            count = original.count(old_text) if old_text else 0
-            total_replacements += count
-            new_rt = {
-                "type": "text",
-                "text": {
-                    "content": original.replace(old_text, new_text),
-                },
-            }
-            if rt.get("annotations"):
-                new_rt["annotations"] = rt["annotations"]
-            if rt.get("text", {}).get("link"):
-                new_rt["text"]["link"] = rt["text"]["link"]
+            new_rt = self.convert_rich_text_for_write([rt])[0]
+            if new_rt["type"] == "text" and old_text:
+                original = new_rt["text"]["content"]
+                total_replacements += original.count(old_text)
+                new_rt["text"]["content"] = original.replace(old_text, new_text)
             updated.append(new_rt)
         return updated, total_replacements
 
@@ -1182,16 +1395,28 @@ class NotionClient:
         }
 
         if output_path:
-            path = Path(output_path)
+            path = resolve_local_path(output_path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(snapshot, indent=2, ensure_ascii=False))
+            path.write_text(
+                json.dumps(snapshot, indent=2, ensure_ascii=False), encoding="utf-8"
+            )
 
         return snapshot
 
     def restore_page_from_snapshot(
         self, page_id: str, snapshot: dict | str
     ) -> dict:
-        """Restore a page from a snapshot, replacing all current content.
+        """Restore a page's content from a snapshot without risking data loss.
+
+        The snapshot content is written first; the page's previous blocks are
+        deleted only after that write succeeds. If the write fails, the new
+        blocks are removed and the page is left as it was.
+
+        Blocks that cannot be recreated through the API (subpages, inline
+        databases, Notion-hosted files, synced blocks) are never deleted from
+        the page: they stay, above the restored content, and are counted in
+        ``preserved``. Snapshot blocks that cannot be recreated are counted
+        in ``skipped``.
 
         Args:
             page_id: The page to restore into.
@@ -1201,69 +1426,57 @@ class NotionClient:
             Summary of the restoration.
         """
         if isinstance(snapshot, str):
-            snapshot = json.loads(Path(snapshot).read_text())
+            snapshot = json.loads(
+                resolve_local_path(snapshot).read_text(encoding="utf-8")
+            )
 
-        # Step 1: Delete all current blocks
-        current = self.get_block_children(page_id)
-        deleted = 0
+        snapshot_blocks = snapshot.get("blocks", [])
+        write_blocks = [
+            converted
+            for block in snapshot_blocks
+            if (converted := self.convert_block_for_write(block))
+        ]
+        skipped = self.unsupported_block_types(snapshot_blocks)
+
+        current = self.get_block_children_deep(page_id)
+        current_ids = {block["id"] for block in current}
+        preserved: Counter = Counter()
+        to_delete: list[str] = []
         for block in current:
-            try:
-                self.delete_block(block["id"])
-                deleted += 1
-            except httpx.HTTPStatusError:
-                pass  # Already deleted or archived
+            unsupported = self.unsupported_block_types([block])
+            if unsupported:
+                preserved += unsupported
+            else:
+                to_delete.append(block["id"])
 
-        # Step 2: Recreate blocks from snapshot
-        blocks = snapshot.get("blocks", [])
-        created = self._restore_blocks(page_id, blocks)
+        try:
+            created = self.append_tree(page_id, write_blocks)
+        except Exception:
+            # Roll back whatever was written; the previous content is intact.
+            for block in self.get_block_children(page_id):
+                if block["id"] not in current_ids:
+                    try:
+                        self.delete_block(block["id"])
+                    except NotionAPIError:
+                        pass
+            raise
+
+        deleted = 0
+        for block_id in to_delete:
+            try:
+                self.delete_block(block_id)
+                deleted += 1
+            except NotionAPIError:
+                pass  # Already deleted or archived
 
         return {
             "status": "ok",
             "deleted": deleted,
-            "created": created,
+            "created": len(created),
+            "preserved": dict(preserved),
+            "skipped": dict(skipped),
             "page_id": page_id,
         }
-
-    def _restore_blocks(self, parent_id: str, blocks: list[dict]) -> int:
-        """Recursively restore blocks under a parent."""
-        count = 0
-        write_blocks = []
-
-        for block in blocks:
-            converted = self.convert_block_for_write(block)
-            if converted:
-                write_blocks.append((block, converted))
-
-        # Separate table blocks (need children inline) from others
-        batch = []
-        for orig, conv in write_blocks:
-            batch.append(conv)
-
-        if batch:
-            created = self.append_children(parent_id, batch)
-            count += len(created)
-
-            # Now handle children for non-table, non-inline-children blocks
-            # Tables already have their children inline, but other blocks
-            # with children (like toggles, list items) that had children
-            # fetched recursively need to be added after creation.
-            created_idx = 0
-            for orig, conv in write_blocks:
-                if created_idx >= len(created):
-                    break
-                new_id = created[created_idx]["id"]
-
-                # If original had children AND they weren't already inlined
-                has_inlined = (
-                    orig.get("type") in ("table", "column_list", "column")
-                    or conv.get(orig.get("type", ""), {}).get("children")
-                )
-                if orig.get("children") and not has_inlined:
-                    count += self._restore_blocks(new_id, orig["children"])
-
-                created_idx += 1
-
-        return count
 
     # ── Page-level text extraction (for reading) ─────────────────────
 
@@ -1313,6 +1526,21 @@ class NotionClient:
                     for cell in cells
                 )
                 lines.append(f"{indent}| {row} |")
+            elif btype in ("child_page", "child_database"):
+                kind = "page" if btype == "child_page" else "database"
+                lines.append(f"{indent}[{kind}: {bdata.get('title', '')}]")
+            elif btype == "equation":
+                lines.append(f"{indent}$$ {bdata.get('expression', '')} $$")
+            elif btype in ("bookmark", "embed"):
+                lines.append(f"{indent}[{btype}]({bdata.get('url', '')})")
+            elif btype in NotionClient.MEDIA_BLOCK_TYPES:
+                source = bdata.get(bdata.get("type", ""), {}) or {}
+                caption = "".join(
+                    rt.get("plain_text", "") for rt in bdata.get("caption", [])
+                )
+                label = caption or btype
+                prefix = "!" if btype == "image" else ""
+                lines.append(f"{indent}{prefix}[{label}]({source.get('url', '')})")
             else:
                 if text:
                     lines.append(f"{indent}{text}")

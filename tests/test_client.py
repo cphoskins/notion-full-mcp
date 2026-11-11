@@ -1,6 +1,5 @@
 """Tests for NotionClient — mocked, no real credentials needed."""
 
-import json
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -158,9 +157,8 @@ class TestFindAndReplaceText:
 
     Previously, find_and_replace_text would silently report success when
     old_text did not match any content in the block (including Unicode
-    mismatches like en-dash U+2013 vs hyphen U+002D). Those silent no-ops
-    caused real incidents on the Cauldra DXI Book during IR-R3 and IR-R4
-    cycles. Now zero replacements raise ValueError with a diagnostic
+    mismatches like en-dash U+2013 vs hyphen U+002D), so edits appeared to
+    land when nothing had changed. Now zero replacements raise ValueError with a diagnostic
     preview of the block's current text so the caller can see exactly
     what characters are in the block and pick the right fix tool.
     """
@@ -189,7 +187,7 @@ class TestFindAndReplaceText:
         }
 
     def test_successful_replacement_returns_count(self, client):
-        block = self._make_paragraph_block("The partner count is 256 at Y4Q4.")
+        block = self._make_paragraph_block("The total is 256 this quarter.")
         client.get_block = MagicMock(return_value=block)
         client.update_block_rich_text = MagicMock(return_value={"id": "test-block-id"})
 
@@ -201,7 +199,7 @@ class TestFindAndReplaceText:
         assert result["replacements"] == 1
 
     def test_multiple_replacements_counted(self, client):
-        block = self._make_paragraph_block("256 partners at Y4. The 256 ecosystem drives 256 deals.")
+        block = self._make_paragraph_block("256 items today. The 256 total includes 256 more.")
         client.get_block = MagicMock(return_value=block)
         client.update_block_rich_text = MagicMock(return_value={"id": "test-block-id"})
 
@@ -227,20 +225,20 @@ class TestFindAndReplaceText:
         assert "Unicode character mismatch" in error_msg  # actionable hint
 
     def test_en_dash_hyphen_mismatch_raises(self, client):
-        """The exact bug from IR-R3-14 and IR-R4 Competitive Landscape $67K-$200K fix."""
+        """En-dash in the block, hyphen-minus in the search string."""
         # Block contains en-dash U+2013
-        block = self._make_paragraph_block("Cauldra enters at $67K\u2013$200K ACV.")
+        block = self._make_paragraph_block("Allow 10\u201320 working days.")
         client.get_block = MagicMock(return_value=block)
 
         # Caller searches for hyphen-minus U+002D (different character)
         with pytest.raises(ValueError) as exc_info:
             client.find_and_replace_text(
-                "test-block-id", "$67K-$200K", "$80K-$500K"
+                "test-block-id", "10-20", "15-30"
             )
 
         # Error should include the actual block content so caller can see
         # what characters are really in there
-        assert "$67K" in str(exc_info.value)
+        assert "working days" in str(exc_info.value)
 
     def test_empty_old_text_raises(self, client):
         """Empty old_text would match infinitely many positions; treat as no-match."""
