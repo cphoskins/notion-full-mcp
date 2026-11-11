@@ -6,12 +6,12 @@
     "url": "https://github.com/cphoskins/notion-full-mcp",
     "source": "github"
   },
-  "version": "0.5.0",
+  "version": "0.5.1",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "notion-full-mcp",
-      "version": "0.5.0",
+      "version": "0.5.1",
       "transport": {
         "type": "stdio"
       },
