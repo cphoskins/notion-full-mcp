@@ -3,6 +3,11 @@
 
 Notion MCP server with deep page reading, surgical block editing, safe snapshot/restore, file uploads (Notion-hosted images and PDFs), table row manipulation, page move and copy, and page restore from trash.
 
+## What's new in v0.5.1
+
+- **Tool annotations.** Every tool declares whether it is read-only, additive or destructive, so MCP clients can decide what to run without asking.
+- **MCP Registry.** The server is published to the official MCP Registry as `io.github.cphoskins/notion-full-mcp`.
+
 ## What's new in v0.5.0
 
 - **Restore keeps the page in order.** Subpages, inline databases and Notion-hosted files that are still on the page stay untouched, and the restored content is written around them in snapshot order.
@@ -171,6 +176,14 @@ Or for local development:
 | `insert_table_row` | Insert a new row into an existing table with automatic width validation |
 | `update_table_cell` | Replace the text of a single cell in a table row |
 
+### Tool annotations
+
+Every tool carries MCP annotations so a client can decide what is safe to run without asking:
+
+- **Read-only (11):** search, page and block reads, comments list, database reads and user lookups.
+- **Adds without loss (13):** inserts, appends, uploads, page and comment creation, `move_page`, `restore_page`, and the two tools that write local files (`snapshot_page`, `download_image_block`).
+- **Marked destructive (9):** `update_block_text`, `update_block_rich_text`, `find_replace_in_block`, `update_table_cell`, `replace_image_block`, `delete_block`, `update_page`, `copy_page_to_parent` and `restore_page_from_snapshot`. They overwrite, delete or archive existing content.
+
 ## Block support and limits
 
 - **Round-trip (snapshot/restore and copy):** paragraph, headings (including toggleable), bulleted and numbered lists, to-do, quote, callout, toggle, code, divider, table, columns, table of contents, equation, bookmark, embed, and externally hosted image, file, video, PDF and audio blocks.
@@ -180,6 +193,7 @@ Or for local development:
   - **File saved with the snapshot:** uploaded again and recreated in place (`uploaded`). Files over 20 MB, or over the workspace upload limit, are not uploaded.
   - **In Notion's trash:** brought back as the same block (`restored_from_trash`). Notion returns it to the end of the page, so a block that is still on the page and came later in the snapshot ends up above it and is reported as `out_of_order`.
   - **Gone from trash, with no saved file:** cannot be restored (`skipped`).
+  - **Why `out_of_order` blocks are not moved (by design):** the Notion API has no way to reposition a block. The only way to move a subpage or database is to trash it and restore it, which sends it to the end of the page and, if it failed midway, would leave it in trash. Restore never deletes something it cannot recreate, so it reports the block and leaves it for you to drag into place.
 - **Snapshots:** record subpages and inline databases as blocks, without their own content. Notion-hosted files are saved only with `include_files`; otherwise the snapshot holds links that expire within the hour.
 - **Queries:** `query_database` returns at most 500 rows and sets `truncated` when more matched.
 - **Find/replace:** matches within one formatting run. A phrase that spans a bold or link boundary is reported as not found.

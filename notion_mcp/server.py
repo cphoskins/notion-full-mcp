@@ -20,6 +20,17 @@ mcp = FastMCP(
 _client: NotionClient | None = None
 
 
+# Tool annotations: hints that let an MCP client decide which calls are safe
+# to run without asking. Every tool talks to Notion, an external service.
+READ_ONLY = {"readOnlyHint": True, "openWorldHint": True}
+# Creates something new (in Notion or on disk); nothing existing is lost.
+ADDS = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True}
+ADDS_IDEMPOTENT = {**ADDS, "idempotentHint": True}
+# Overwrites, deletes or archives existing content.
+CHANGES = {"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True}
+CHANGES_IDEMPOTENT = {**CHANGES, "idempotentHint": True}
+
+
 def _get_client() -> NotionClient:
     global _client
     if _client is None:
@@ -35,7 +46,7 @@ def _get_client() -> NotionClient:
 # ── Search & Page Info ───────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def search_pages(query: str, max_results: int = 10) -> str:
     """Search Notion pages by title. Returns page IDs, titles, and URLs."""
     try:
@@ -55,7 +66,7 @@ def search_pages(query: str, max_results: int = 10) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def search(
     query: str,
     filter_type: str = "",
@@ -94,7 +105,7 @@ def search(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def get_page_info(page_id: str) -> str:
     """Get metadata for a Notion page (title, parent, dates, URL)."""
     try:
@@ -116,7 +127,7 @@ def get_page_info(page_id: str) -> str:
 # ── Read ─────────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def read_page_deep(
     page_id: str, max_depth: int = 5, format: str = "markdown"
 ) -> str:
@@ -140,7 +151,7 @@ def read_page_deep(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def list_block_children(block_id: str, include_text: bool = True) -> str:
     """List direct children of a block or page (shallow, no recursion).
 
@@ -181,7 +192,7 @@ def list_block_children(block_id: str, include_text: bool = True) -> str:
 # ── Surgical Edit ────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES_IDEMPOTENT)
 def update_block_text(block_id: str, new_text: str) -> str:
     """Replace all text in a specific block with new plain text.
 
@@ -196,7 +207,7 @@ def update_block_text(block_id: str, new_text: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES)
 def find_replace_in_block(block_id: str, old_text: str, new_text: str) -> str:
     """Find and replace text within a block, preserving all formatting.
 
@@ -235,7 +246,7 @@ def find_replace_in_block(block_id: str, old_text: str, new_text: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES_IDEMPOTENT)
 def update_block_rich_text(block_id: str, rich_text_json: str) -> str:
     """Update a block's rich text with fully specified formatting.
 
@@ -254,7 +265,7 @@ def update_block_rich_text(block_id: str, rich_text_json: str) -> str:
 # ── Insert ───────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def insert_blocks_after(block_id: str, blocks_json: str) -> str:
     """Insert new blocks after a specific block.
 
@@ -276,7 +287,7 @@ def insert_blocks_after(block_id: str, blocks_json: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def insert_text_after(
     block_id: str, text: str, block_type: str = "paragraph"
 ) -> str:
@@ -300,7 +311,7 @@ def insert_text_after(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def append_blocks_to_page(page_id: str, blocks_json: str) -> str:
     """Append blocks to the end of a page.
 
@@ -322,7 +333,7 @@ def append_blocks_to_page(page_id: str, blocks_json: str) -> str:
 # ── Media & Files ────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def upload_file(file_path: str) -> str:
     """Upload a file to Notion's own storage.
 
@@ -349,7 +360,7 @@ def upload_file(file_path: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def upload_image_as_block(
     file_path: str,
     after_block_id: str = "",
@@ -394,7 +405,7 @@ def upload_image_as_block(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES)
 def replace_image_block(
     block_id: str,
     file_path: str,
@@ -465,7 +476,7 @@ def replace_image_block(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def download_image_block(block_id: str, output_path: str) -> str:
     """Download the image file from an image block to a local path.
 
@@ -491,7 +502,7 @@ def download_image_block(block_id: str, output_path: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def upload_file_as_block(
     file_path: str,
     after_block_id: str = "",
@@ -541,7 +552,7 @@ def upload_file_as_block(
 # ── Tables ───────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def insert_table_row(
     table_id: str,
     cells_json: str,
@@ -581,7 +592,7 @@ def insert_table_row(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES_IDEMPOTENT)
 def update_table_cell(
     row_id: str,
     cell_index: int,
@@ -606,7 +617,7 @@ def update_table_cell(
 # ── Delete ───────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES_IDEMPOTENT)
 def delete_block(block_id: str) -> str:
     """Delete a specific block by ID."""
     try:
@@ -620,7 +631,7 @@ def delete_block(block_id: str) -> str:
 # ── Snapshot / Restore ───────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def snapshot_page(
     page_id: str, output_path: str = "", include_files: bool = False
 ) -> str:
@@ -666,7 +677,7 @@ def snapshot_page(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES)
 def restore_page_from_snapshot(page_id: str, snapshot_path: str) -> str:
     """Restore a page from a previously saved snapshot.
 
@@ -709,7 +720,7 @@ def _count_blocks(blocks: list[dict]) -> int:
 # ── Pages ────────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def create_page(
     parent_id: str,
     title: str,
@@ -754,7 +765,7 @@ def create_page(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES_IDEMPOTENT)
 def update_page(
     page_id: str,
     title: str = "",
@@ -808,7 +819,7 @@ def update_page(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS_IDEMPOTENT)
 def move_page(
     page_id: str,
     new_parent_id: str,
@@ -836,7 +847,7 @@ def move_page(
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS_IDEMPOTENT)
 def restore_page(page_id: str) -> str:
     """Restore a page (and its children) from trash.
 
@@ -864,7 +875,7 @@ def restore_page(page_id: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=CHANGES)
 def copy_page_to_parent(
     page_id: str,
     new_parent_id: str,
@@ -913,7 +924,7 @@ def copy_page_to_parent(
 # ── Comments ─────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=ADDS)
 def create_comment(page_id: str, text: str) -> str:
     """Add a comment to a Notion page."""
     try:
@@ -924,7 +935,7 @@ def create_comment(page_id: str, text: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def list_comments(block_id: str) -> str:
     """List all comments on a page or block."""
     try:
@@ -948,7 +959,7 @@ def list_comments(block_id: str) -> str:
 # ── Databases ─────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def get_database(database_id: str) -> str:
     """Get metadata and schema for a Notion database."""
     try:
@@ -969,7 +980,7 @@ def get_database(database_id: str) -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def query_database(
     database_id: str,
     filter_json: str = "",
@@ -1010,7 +1021,7 @@ def query_database(
 # ── Users ─────────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def get_self() -> str:
     """Get the current authenticated Notion user or bot info."""
     try:
@@ -1021,7 +1032,7 @@ def get_self() -> str:
         return json.dumps({"status": "error", "message": str(e)})
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def list_users() -> str:
     """List all users in the workspace."""
     try:
@@ -1044,7 +1055,7 @@ def list_users() -> str:
 # ── Blocks ────────────────────────────────────────────────────────────
 
 
-@mcp.tool
+@mcp.tool(annotations=READ_ONLY)
 def get_block(block_id: str) -> str:
     """Get a single block by ID, including its type, content, and metadata."""
     try:

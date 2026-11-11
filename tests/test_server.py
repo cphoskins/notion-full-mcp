@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from notion_mcp import server
+from notion_mcp import __version__, server
 from notion_mcp.client import NotionAPIError, NotionClient
 from tests.conftest import para, text
 
@@ -44,9 +44,29 @@ def nc(client):
 def test_all_tools_registered_and_documented():
     tools = asyncio.run(server.mcp.list_tools())
     names = {t.name for t in tools}
-    listed = {t["name"] for t in json.load(open("server.json"))["tools"]}
-    assert names == listed
+    assert names == {name for name, _ in ALL_TOOL_CALLS}
+    assert len(names) == 33
     assert all(t.description for t in tools)
+
+
+def test_tool_annotations():
+    tools = {t.name: t.annotations for t in asyncio.run(server.mcp.list_tools())}
+    assert all(a is not None and a.openWorldHint for a in tools.values())
+    read_only = {name for name, a in tools.items() if a.readOnlyHint}
+    assert read_only == {
+        "search_pages", "search", "get_page_info", "read_page_deep",
+        "list_block_children", "list_comments", "get_database",
+        "query_database", "get_self", "list_users", "get_block",
+    }
+    destructive = {name for name, a in tools.items() if a.destructiveHint}
+    assert destructive == {
+        "update_block_text", "find_replace_in_block", "update_block_rich_text",
+        "replace_image_block", "update_table_cell", "delete_block",
+        "restore_page_from_snapshot", "update_page", "copy_page_to_parent",
+    }
+    # Every tool that writes says whether it can destroy anything.
+    assert all(a.destructiveHint is not None for n, a in tools.items() if n not in read_only)
+    assert tools["restore_page"].idempotentHint and not tools["create_page"].idempotentHint
 
 
 def test_get_client_requires_token(monkeypatch):
@@ -268,9 +288,13 @@ ALL_TOOL_CALLS = [
 ]
 
 
-def test_error_table_covers_every_tool():
-    listed = {t["name"] for t in json.load(open("server.json"))["tools"]}
-    assert {name for name, _ in ALL_TOOL_CALLS} == listed
+def test_server_json_matches_package():
+    manifest = json.load(open("server.json"))
+    package = manifest["packages"][0]
+    assert manifest["version"] == package["version"] == __version__
+    assert package["registryType"] == "pypi" and package["identifier"] == "notion-full-mcp"
+    assert len(manifest["description"]) <= 100  # registry limit
+    assert f"mcp-name: {manifest['name']}" in open("README.md").read()
 
 
 @pytest.mark.parametrize("name,args", ALL_TOOL_CALLS)
