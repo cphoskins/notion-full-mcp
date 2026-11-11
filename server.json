@@ -1,60 +1,34 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.cphoskins/notion-full-mcp",
-  "description": "Notion MCP server with deep page reading, surgical block editing, safe snapshot/restore, file uploads (Notion-hosted images/PDFs), table row manipulation, and page move/copy",
-  "version": "0.5.0",
+  "description": "Notion MCP server: deep reads, block editing, safe snapshot/restore, file uploads, page move/copy",
   "repository": {
     "url": "https://github.com/cphoskins/notion-full-mcp",
     "source": "github"
   },
+  "version": "0.5.0",
   "packages": [
     {
-      "registry_name": "pypi",
-      "name": "notion-full-mcp",
+      "registryType": "pypi",
+      "identifier": "notion-full-mcp",
       "version": "0.5.0",
-      "runtime": "python",
-      "environment_variables": [
+      "transport": {
+        "type": "stdio"
+      },
+      "environmentVariables": [
         {
           "name": "NOTION_API_TOKEN",
           "description": "Your Notion integration API token (starts with ntn_)",
-          "required": true
+          "isRequired": true,
+          "isSecret": true
+        },
+        {
+          "name": "NOTION_MCP_FILE_ROOT",
+          "description": "Optional directory that uploads, downloads and snapshots are confined to",
+          "isRequired": false,
+          "isSecret": false
         }
       ]
     }
-  ],
-  "tools": [
-    {"name": "search_pages", "description": "Search Notion pages by title"},
-    {"name": "search", "description": "Search Notion pages and/or databases"},
-    {"name": "get_page_info", "description": "Get page metadata (title, parent, dates, URL)"},
-    {"name": "create_page", "description": "Create a new page under a parent page or database"},
-    {"name": "update_page", "description": "Update a page's title, icon, or archive status"},
-    {"name": "move_page", "description": "Move a page under a new parent page, keeping its ID and content"},
-    {"name": "restore_page", "description": "Restore a page (and its cascade-archived children) from trash"},
-    {"name": "copy_page_to_parent", "description": "Recreate a page under a new parent page or database; archives the original only when everything was copied"},
-    {"name": "read_page_deep", "description": "Read page with all nested children recursively"},
-    {"name": "list_block_children", "description": "List direct children of a block or page"},
-    {"name": "get_block", "description": "Get a single block by ID"},
-    {"name": "update_block_text", "description": "Replace all text in a block"},
-    {"name": "find_replace_in_block", "description": "Find/replace text preserving formatting"},
-    {"name": "update_block_rich_text", "description": "Update block with full rich text specification"},
-    {"name": "insert_text_after", "description": "Insert a text block after a specific block"},
-    {"name": "insert_blocks_after", "description": "Insert multiple blocks after a specific block"},
-    {"name": "append_blocks_to_page", "description": "Append blocks to the end of a page"},
-    {"name": "delete_block", "description": "Delete a block by ID"},
-    {"name": "create_comment", "description": "Add a comment to a page"},
-    {"name": "list_comments", "description": "List all comments on a page or block"},
-    {"name": "get_database", "description": "Get database metadata and schema"},
-    {"name": "query_database", "description": "Query a database with filters and sorts"},
-    {"name": "get_self", "description": "Get the current authenticated user/bot"},
-    {"name": "list_users", "description": "List all workspace users"},
-    {"name": "snapshot_page", "description": "Save complete page structure as JSON snapshot, optionally with Notion-hosted files"},
-    {"name": "restore_page_from_snapshot", "description": "Restore page content from a snapshot; writes first, rolls back on failure, keeps subpages and databases in place, restores deleted ones from trash, re-uploads saved files"},
-    {"name": "upload_file", "description": "Upload a file to Notion's own storage and return a file_upload_id"},
-    {"name": "upload_image_as_block", "description": "Upload an image to Notion and insert it as an image block in one step"},
-    {"name": "replace_image_block", "description": "Replace an existing image block with a newly uploaded file, keeping its position"},
-    {"name": "download_image_block", "description": "Download an image block's file to a local path"},
-    {"name": "upload_file_as_block", "description": "Upload any file (PDF, attachment) to Notion and insert it as a file block"},
-    {"name": "insert_table_row", "description": "Insert a new row into an existing table with width validation"},
-    {"name": "update_table_cell", "description": "Replace the text of a single cell in a table row"}
   ]
 }
